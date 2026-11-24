@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="A page with text lines and an arrow pointing into a slot box">
+  <rect x="2.5" y="2.5" width="59" height="59" rx="14" fill="#F1F7F4" stroke="#3F7D58" stroke-width="3"/>
+  <rect x="10" y="12" width="23" height="36" rx="4" fill="#FFFFFF" stroke="#3F7D58" stroke-width="2.5"/>
+  <rect x="14.5" y="18" width="14" height="3" rx="1.5" fill="#3F7D58"/>
+  <rect x="14.5" y="25" width="10" height="3" rx="1.5" fill="#C3DFCE"/>
+  <rect x="14.5" y="31" width="12" height="3" rx="1.5" fill="#C3DFCE"/>
+  <rect x="14.5" y="37" width="8" height="3" rx="1.5" fill="#C3DFCE"/>
+  <path d="M35.5 30h5.5" stroke="#3F7D58" stroke-width="3" stroke-linecap="round"/>
+  <path d="M39.5 25l6 5-6 5z" fill="#3F7D58"/>
+  <rect x="45" y="18" width="11" height="24" rx="3.5" fill="#2C5A3F"/>
+  <rect x="47.5" y="23.5" width="6" height="2.5" rx="1.25" fill="#F1F7F4"/>
+</svg>

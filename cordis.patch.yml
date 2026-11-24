@@ -1,0 +1,20 @@
+# dsh-gzh-publisher bundle layer.
+#
+# 装好包后由 profile 的 `dsh.profile.bundles` 自动挂上；行 id == 设置命名空间。
+#
+# 这里刻意**不写 config**：账号、代理、排版都是运行期数据，改一次就重启一次插件
+# 没必要。账号表落在 `~/.dsh/gzh-publisher/accounts.json`（用 gzh_account_set 工具写），
+# 全局参数走设置页（导出自 src/host.js 的 Config）。
+#
+# 需要固化到补丁里时，按下面的样子加 `config:` 即可：
+#
+# - insert:
+#     - id: gzh-publisher
+#       name: dsh-gzh-publisher
+#       config:
+#         defaultAccount: my-gzh
+#         defaultLayout: teal
+#         dataDir: ~/.dsh/gzh-publisher
+- insert:
+    - id: gzh-publisher
+      name: dsh-gzh-publisher

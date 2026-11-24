@@ -1,0 +1,12 @@
+{
+  "$schema": "../schema/plugin.schema.json",
+  "id": "6392463/dsh-gzh-publisher",
+  "name": "dsh-gzh-publisher",
+  "repository": "https://github.com/6392463/dsh-gzh-publisher",
+  "category": "tools",
+  "description": {
+    "en": "Renders Markdown into WeChat Official Account HTML, compresses images, and pushes the result to the account draft box through a user-configured API proxy.",
+    "zh": "把 Markdown 排成公众号版式、压缩配图，并经用户自配的 API 代理把成品推进公众号草稿箱（不含发布接口）。"
+  },
+  "added": "2026-11-24"
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WeChat draft publisher",
+    "description": "Renders an article into WeChat HTML with the production layout (inline images are compressed under 1 MB and uploaded to the WeChat CDN), then pushes it to the draft box through a configurable proxy. Accounts, secrets, proxy address, layout skins and the comment switch are all configured in the panel's Settings dialog — no code changes. Four neutral built-in skins, and a custom skin is just seven colour fields. Articles come from the Media Desk workspace, or you can paste Markdown directly when it is unavailable. Pushing is gated: nothing can be sent until a rendered proof exists and you have reviewed it, and images off the WeChat CDN, links a reader cannot open, or a same-title draft already sitting in the draft box all stop the push; a ledger fingerprint blocks duplicates. Built for personal (unverified) subscription accounts: drafts only, no publishing APIs. The gzh_render / gzh_push_draft / gzh_draft_verify tools run the same pipeline from a chat."
+  }
+}

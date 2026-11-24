@@ -1,0 +1,15 @@
+# awesome-dsh-plugin 条目草稿。
+# 提交时复制成该仓库的 data/plugins/6392463__dsh-gzh-publisher.yml（文件名 = owner__repo），
+# 一个 PR 只放这一个文件、最多 3 条；字段以他们仓库里的 schema / CONTRIBUTING 为准。
+# 不要手写 npm: 字段——是否可安装由站点从 npm 上带 dsh.bundle 的包自己判定。
+url: https://github.com/6392463/dsh-gzh-publisher
+name: dsh-gzh-publisher
+category: tools
+description:
+  en: >-
+    Renders Markdown into WeChat Official Account HTML, compresses images, and
+    pushes the result to the account draft box through a user-configured API proxy.
+  zh: >-
+    把 Markdown 排成公众号版式、压缩配图，并经用户自配的 API 代理把成品推进公众号草稿箱（不含发布接口）。
+# icon 必须是 GitHub 上的**位图**（PNG/JPG）路径，SVG 会被拒；仓库现在的 icon.svg 不能直接用。
+# icon: https://raw.githubusercontent.com/6392463/dsh-gzh-publisher/main/icon.png
