@@ -164,6 +164,26 @@
 
 `gzh_layout_preview`（面板上的「排版样稿」）会写出 `out/preview-<layout>.html`，面板里直接内嵌显示，也能浏览器打开就是手机上看到的宽度。
 
+## 安装（源码安装，没有 npm 包）
+
+`dependencies` 是空的（`@deepseek-ai/schemastery` 只是 optional peer，宿主本来就提供；压图调 DSH 自带的 Python + Pillow），所以**没有 `npm install` 这一步**——「安装」就是把仓库放到本机，然后在 profile 的 `node_modules` 里建一个符号链接：
+
+```bash
+git clone https://github.com/6392463/dsh-gzh-publisher.git ~/dsh-plugins/dsh-gzh-publisher
+
+# Linux / macOS
+ln -s ~/dsh-plugins/dsh-gzh-publisher ~/.dsh/profiles/desktop/node_modules/dsh-gzh-publisher
+
+# Windows（普通 cmd 建不了符号链接：用管理员 cmd，或先在「设置 → 隐私和安全性 → 开发者其他选项」里开开发者模式）
+mklink /D "%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-gzh-publisher" "C:\dsh-plugins\dsh-gzh-publisher"
+```
+
+- `desktop` 换成你自己的 profile 目录名——`~/.dsh/profiles/` 下面有哪几个目录就是哪几个。
+- 建完**重启一次 DSH**：`package.json` 的 `dsh.client` 声明不参与热加载。重启后 设置 → 插件 里会出现「公众号草稿推送」，打开它 → 新建账号，必填只有 4 项（key、显示名、appid、appsecret），走代理再加代理地址 + 代理密钥（两个密钥框是密码框，留空表示不改动）；左侧边栏会出现「公众号草稿」面板。
+- 装完第一件事建议跑只读的 `gzh_draft_verify`：`ok: true` 一次同时证明四件事——网络通代理、代理令牌有效、appid/appsecret 有效、出口 IP 在公众号后台白名单内。别拿「推一篇测试草稿」验证，草稿推出去只能手工删。
+- 用符号链接装的好处是改完源码即用（见下一条）；不想边用边改，就把目录整个复制过去代替链接。
+- 没有一键安装命令可用：本包未发布到 npm，插件管理器里的 `install_bundle`（走 registry）对它无效，只能按上面这样装。
+
 ## 已知限制与未验证项
 
 - **`media/uploadimg` 与 `material/add_material` 的请求形状未做实网验证**：代码按微信官方文档写；两处上传都按扩展名声明 `Content-Type`（`.jpg` 就是 `image/jpeg`，以前一律谎报 `image/png`）。第一次真推请先 `gzh_render`（`upload: false`）＋ 一张小图，确认图床返回 `url` 再往下走。
@@ -179,7 +199,7 @@
 
 ```
 npm run check   # node --check 所有 src/*.js（含 client.js、routes.js）
-npm test        # tests/smoke.mjs：289 项离线断言，不联网
+npm test        # tests/smoke.mjs：315 项离线断言，不联网
 ```
 
 自检覆盖：排版结构与转义（含软换行、颜色注入拦截）、结构化语法（有序/多级列表编号、缩进续行、表格表头与斑马纹、代码块缩进与未闭合围栏、`####` 小标题、分割线、front matter）、长度按码点算（emoji 标题不翻倍、截断不产生乱码）、正文体检（外链/非图床图命中与放行、去重）、皮肤增删改与旧 key 自动迁移、账号掩码与评论开关归一化、指纹稳定、渲染→推送每道闸门的拒绝路径（含篡改文件、跨账号、串号、同名草稿、force 绕过）、**推送链路接假 `fetch`**（`draft/add` 请求体逐字段核对：摘要截断、`need_open_comment` / `only_fans_can_comment` 的缺省与覆盖、预检在真推之前、微信报错也进台账）、上传 MIME 按扩展名、配图相对路径（按稿子所在目录解析、找不到就说清去过哪儿、同一张图的副本不误报「没引用」、条目登记了但正文没引用会点名）、工作台读取与降级、配图实压（含真实素材）、工具 `output` 契约（复刻宿主校验）、`/gzh-api` 的令牌/同源/路径穿越/白名单/停用闸门、Client 半的模块清单 + 三栏与设置弹窗结构 + 主题变量约束 + 推送按钮门控 + 一次真实组件渲染。
