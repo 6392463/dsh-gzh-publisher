@@ -1,6 +1,6 @@
 {
   "name": "dsh-gzh-publisher",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "把文章按公众号排版渲染成微信 HTML：渲染时就定好封面（工作台登记的，没登记就从配图里挑一张并上传成永久素材）与每张插图落在哪一节（认「第N张图」占位标题、图自带的锚点，都没有就均匀分配；你自己写的位置绝不动），配图自动压到 1MB 内并上传图床，列表/表格/代码块都按微信编辑器能活下来的方式重排，再通过可配置的代理推送进公众号草稿箱。账号、密钥、代理地址、排版皮肤、评论区开关都在面板设置里配置，多账号多皮肤无需改代码；推送前先渲染审阅，没有封面、正文一张图都没有、非图床配图、点不开的外链、草稿箱同名草稿和重复推送都会被闸门拦住。面向个人订阅号：只到草稿箱，不含发布类接口。",
   "main": "src/host.js",
@@ -33,7 +33,7 @@
     "README.md"
   ],
   "scripts": {
-    "check": "node --check src/host.js && node --check src/layout.js && node --check src/images.js && node --check src/wechat.js && node --check src/media-desk.js && node --check src/store.js && node --check src/image.js && node --check src/tools.js && node --check src/routes.js && node --check src/client.js",
+    "check": "node --check src/host.js && node --check src/layout.js && node --check src/images.js && node --check src/wechat.js && node --check src/media-desk.js && node --check src/store.js && node --check src/sticker.js && node --check src/image.js && node --check src/tools.js && node --check src/routes.js && node --check src/client.js",
     "test": "node tests/smoke.mjs"
   },
   "dsh": {

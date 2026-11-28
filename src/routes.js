@@ -18,6 +18,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { extname, resolve, sep } from 'node:path'
 import { listSkins, migrateSkinKey, resolveSkin } from './layout.js'
 import { compressorStatus } from './image.js'
+import { resolveStickerRules, DEFAULT_RULE_PROSE, WECHAT_STICKER, STICKER_RULE_FIELDS } from './sticker.js'
 
 export const ROUTE_PREFIX = '/gzh-api'
 
@@ -130,8 +131,28 @@ export function createApiRoutes({ api, store, desk, config, log, getOrigin }) {
           layoutKey: name,
           layoutLabel: skin.label,
           layoutKnown: wanted === '' || knownSkins.has(migrateSkinKey(wanted)),
+          // 贴图规则按**生效值**给：面板不能自己再拼一遍优先级，否则页面和工具层会各说一套。
+          sticker: (() => {
+            const rules = resolveStickerRules({ account: { key, ...account }, config: cfg })
+            return { summary: rules.summary, values: rules.rules, sources: rules.sources, configured: account.sticker ?? null, violations: rules.violations }
+          })(),
         }
       }),
+      // 全局参数页只读展示：四个贴图档的当前生效值 + 该填的范围（微信硬上限在那儿，别让人填出个填不进去的数）
+      stickerDefaults: (() => {
+        const rules = resolveStickerRules({ config: cfg })
+        return {
+          summary: rules.summary, values: rules.rules, sources: rules.sources,
+          prose: DEFAULT_RULE_PROSE,
+          hard: { title: WECHAT_STICKER.titleMax, images: `${WECHAT_STICKER.imageMin}~${WECHAT_STICKER.imageMax}`, digest: WECHAT_STICKER.digestMax },
+          // 同时给规则 key（面板绑表单、查来源用它）与全局配置的扁平字段名（只读页展示它）
+          fields: STICKER_RULE_FIELDS.filter(row => row.globalKey !== undefined)
+            .map(row => ({
+              key: row.key, globalKey: row.globalKey, label: row.label,
+              min: row.min, max: row.max, hint: row.hint, value: rules.rules[row.key],
+            })),
+        }
+      })(),
       // 带上整组 colors：设置弹窗要能改配色，就得读到当前值（这里没有密钥，随便读）
       skins: skinRows.map(row => ({
         key: row.key, label: row.label, builtIn: row.builtIn, colors: row.colors, accent: row.colors.accent,

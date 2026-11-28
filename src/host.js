@@ -16,6 +16,7 @@
  */
 import Schema from '@deepseek-ai/schemastery'
 import { migrateSkinKey } from './layout.js'
+import { STICKER_RULE_FIELDS, DEFAULT_STICKER_RULES, sanitizeStickerRules } from './sticker.js'
 import { createStore } from './store.js'
 import { createMediaDesk } from './media-desk.js'
 import { registerTools } from './tools.js'
@@ -88,6 +89,36 @@ export const Config = Schema.object({
     .default(60000)
     .description('单次微信接口请求超时（毫秒）。代理链路慢可以适当放大。')
     .volatile(),
+  // 贴图（图片消息）形式规范的全局档。账号的 sticker 块能逐项盖掉这里，
+  // 单次调用又能盖掉账号——生效值与来源在 gzh_push_sticker 的 plan.rules 里能看到。
+  stickerMinImages: Schema.number()
+    .step(1)
+    .min(1)
+    .max(20)
+    .default(6)
+    .description('贴图每条最少几张图（全局默认，账号 sticker.minImages 可覆盖）。微信 1 张就发得出去，所以这是我们自己的口径；单图消息形式的号填 1。')
+    .volatile(),
+  stickerMaxImages: Schema.number()
+    .step(1)
+    .min(1)
+    .max(20)
+    .default(20)
+    .description('贴图每条最多几张图（全局默认，账号 sticker.maxImages 可覆盖）。20 是微信硬上限，调大只会被微信拒。')
+    .volatile(),
+  stickerTitleMax: Schema.number()
+    .step(1)
+    .min(1)
+    .max(32)
+    .default(20)
+    .description('贴图标题最多几字（全局默认，账号 sticker.titleMax 可覆盖）。微信给贴图的硬上限是 32 字，图文才是 64。')
+    .volatile(),
+  stickerTextMax: Schema.number()
+    .step(1)
+    .min(0)
+    .max(5000)
+    .default(1000)
+    .description('贴图说明最多几字（全局默认，账号 sticker.textMax 可覆盖）。填 0 = 要求说明留空；要长文就该走图文。')
+    .volatile(),
 })
 
 /**
@@ -108,11 +139,23 @@ function readValue(value) {
   return value
 }
 
+/**
+ * 贴图规则里有全局档的字段（设置界面用扁平名 `stickerMinImages`，规则内部叫 `minImages`）。
+ * coverFirst 没有全局档：首图当不当封面是某个号的形式习惯，不是全站参数。
+ */
+const STICKER_GLOBAL_KEYS = STICKER_RULE_FIELDS.filter(row => row.globalKey !== undefined)
+
+/** 全局贴图档的默认值（和 sticker.js 的内置默认同源，不在这里再抄一份数）。 */
+function globalStickerDefaults() {
+  return Object.fromEntries(STICKER_GLOBAL_KEYS.map(row => [row.globalKey, DEFAULT_STICKER_RULES[row.key]]))
+}
+
 /** 配置默认值，与 schema 对齐（缺字段时兜底）。 */
 const DEFAULTS = {
   enabled: true, defaultAccount: '', defaultLayout: 'teal', mediaDeskDir: '',
   dataDir: '', autoDigest: true, allowDirectApi: false, maxImageMb: 1, timeoutMs: 60000,
   imageMaxEdge: 1440, pythonPath: '', compressTimeoutMs: 120000,
+  ...globalStickerDefaults(),
 }
 
 /**
@@ -142,6 +185,15 @@ export function normalize(input) {
   out.allowDirectApi = out.allowDirectApi === true || out.allowDirectApi === 'true'
   // 老配置里的皮肤名（曾按号命名）在这里就换算成中性 key，工具层只认新 key。
   out.defaultLayout = migrateSkinKey(String(out.defaultLayout))
+  // 贴图规则的全局档：坏值夹回合法范围，绝不在这里抛——normalize 是在插件激活路径上跑的，
+  // 为一个数字让整个插件加载不了，比这个数错着更糟。真正的口径由 resolveStickerRules 汇总。
+  const sticker = sanitizeStickerRules(
+    Object.fromEntries(STICKER_GLOBAL_KEYS.map(row => [row.key, out[row.globalKey]])),
+    '全局配置',
+  )
+  for (const row of STICKER_GLOBAL_KEYS) {
+    out[row.globalKey] = sticker[row.key] ?? DEFAULT_STICKER_RULES[row.key]
+  }
   return out
 }
 

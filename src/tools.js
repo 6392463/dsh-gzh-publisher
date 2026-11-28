@@ -16,9 +16,13 @@ import { readFileSync, existsSync, statSync, mkdirSync, writeFileSync } from 'no
 import { compressImage, compressorStatus } from './image.js'
 import { basename, dirname, extname, join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { SKINS, SKIN_FIELDS, resolveSkin, listSkins, parseArticle, buildHtml, textLength, clampText, auditWechatSafe } from './layout.js'
+import { SKINS, SKIN_FIELDS, resolveSkin, listSkins, parseArticle, buildHtml, textLength, clampText, auditWechatSafe, WECHAT_LINK } from './layout.js'
 import { planImages } from './images.js'
 import { createClient } from './wechat.js'
+import {
+  WECHAT_STICKER, DEFAULT_STICKER_RULES, DEFAULT_RULE_PROSE, STICKER_RULE_FIELDS, STICKER_RULE_BY_KEY,
+  normalizeStickerRules, resolveStickerRules,
+} from './sticker.js'
 
 /** 工具错误：带上下一步怎么做。 */
 function fail(message, hint = '') {
@@ -92,6 +96,151 @@ function commentSetting(account, pushArgs = {}) {
 }
 
 /**
+ * 贴图（图片消息 / newspic）的边界：**两档，别混为一谈**。数字本身在 `src/sticker.js`，
+ * 这里只说清校验时怎么用它——因为「贴图被拦」绝大多数不是 bug，而是这两档被搞混了。
+ *
+ * 【微信硬上限 WECHAT_STICKER】官方 draft/add 文档 + 真机探针，改不了也 force 不掉：
+ *   一次 1~20 张图（第一张当封面，不传 thumb_media_id）、标题 32 字（**比图文的 64 短一半**）、
+ *   正文只支持纯文本、单张永久图片素材 10MB。
+ *
+ * 【本项目形式规范 sticker】比微信严，且**可以配**：
+ *   单次调用参数 > 账号 `sticker` 块 > 全局配置 stickerXxx > 内置默认（见 DEFAULT_STICKER_RULES）。
+ *   默认口径见 `DEFAULT_STICKER_RULES`（工具描述里的数由 `DEFAULT_RULE_PROSE` 注入，不在这手抄）——
+ *   它是「一组内容」的经验值，不是普适真理：
+ *   单图消息形式的号就该把自己的下限配成 1，而不是每天被闸门拦一次再去勾 force。
+ *   所以：拦下来时，报错里必须同时出现**我们的数、这个数来自哪一层、微信的天花板**，
+ *   否则被拦的人只能看到「少于 6 张」，猜不到该去改哪个号。
+ *   形式规范可被 force=true + reason 绕过；微信硬上限永远绕不过。
+ */
+
+/**
+ * Markdown → 贴图说明（纯文本）。
+ *
+ * 洗掉的每一样都是「在贴图里会变成噪音」的东西：HTML 标签会原样显示；`##`、`==`、`-`
+ * 这些标记同理；图片引用丢掉（图本身就在上面，重复引一次只会占行）；链接**只留文字**——
+ * 未认证号贴图里的裸链接点了没反应，留着等于骗人点。表格分隔行是纯符号，也丢。
+ * 段落换行保留（最多一个空行）：贴图说明是支持换行的，全压成一行反而读不下去。
+ */
+function plainTextFromMarkdown(markdown) {
+  return String(markdown ?? '')
+    // 代码块整段丢：贴图没有等宽字体，一段代码在这里就是一堆对不齐的符号。
+    .replace(/^```[\s\S]*?^```[ \t]*$/gm, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>\n]{1,300}>/g, '')
+    .replace(/^\s*\|[\s:|-]+\|\s*$/gm, '')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*>+\s?/gm, '')
+    .replace(/==|~~|`/g, '')
+    .replace(/\*{1,2}/g, '')
+    // 下划线只成对去掉：snake_case 文件名里的单个下划线不是斜体标记。
+    .replace(/__([^_\n]+)__|\B_([^_\n]+)_\B/g, '$1$2')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/**
+ * 贴图正文的外链与「图片残留」扫描。`auditWechatSafe` 挑的是 `<a href>`，纯文本里没有标签，
+ * 所以这里扫裸链接——个人订阅号未认证，贴图说明里的站外链接一样点不开。
+ *
+ * 顺带把「说明里冒出的图片」也当错误挑出来：贴图没有正文，图片引用洗掉之后剩下的
+ * `![` / `<img` / 一串本地路径，会当成字面量显示在说明里——那是肉眼可见的事故，
+ * 不是能忽略的格式问题。图片只能走配图（image_list）。
+ * @param {string} text 纯文本正文。
+ * @returns {Array<{kind: string, value: string, why: string}>}
+ */
+function auditStickerText(text) {
+  const findings = []
+  const seen = new Set()
+  const push = (kind, value, why) => {
+    const cut = String(value ?? '').trim().slice(0, 80)
+    if (cut === '' || seen.has(`${kind}|${cut}`)) return
+    seen.add(`${kind}|${cut}`)
+    findings.push({ kind, value: cut, why })
+  }
+  for (const match of String(text ?? '').matchAll(/!\[[^\]\n]{0,80}\]?(?:\([^)\n]{0,200}\))?|<img\b[^>\n]{0,300}>?/gi)) {
+    push('image', match[0], '贴图正文只有纯文本，图片要当配图传上去；这句里的图片标记会原样显示成 ! [ … 这样的字')
+  }
+  for (const match of String(text ?? '').matchAll(/[\w.\-/\\]{2,}\.(?:png|jpe?g|gif|webp|bmp|heic)\b/gi)) {
+    push('path', match[0], '说明里出现了图片文件名/路径（贴图没有正文，图就在上面，这串字没人看得懂）；删掉它，或把这张图加进配图')
+  }
+  for (const match of String(text ?? '').matchAll(/https?:\/\/\S+|www\.[\w-]+(?:\.[\w-]+)+/gi)) {
+    // 结尾的中文/英文标点是句子的一部分，不该算进链接里。
+    const value = match[0].replace(/[)）\]】.,;:!?。，；：！？]+$/, '')
+    if (value === '') continue
+    const absolute = /^https?:\/\//i.test(value) ? value : `http://${value}`
+    if (WECHAT_LINK.test(absolute)) continue
+    push('link', value, '贴图说明里的站外链接在未认证订阅号上点不开，删掉或改成截图')
+  }
+  return findings
+}
+
+/**
+ * 贴图配图 → 永久图片素材 media_id。
+ *
+ * 为什么不用现成的 `uploadOne`：它走 `/cgi-bin/media/uploadimg`，只回一个 mmbiz **URL**，
+ * 而贴图的 `image_info` 要的是 **media_id**，两者不通用。永久素材占素材库名额
+ * （图片+图文类共 10 万），所以按「号 + 图片字节 sha256」缓存，同一张图在同一个号上只传一次。
+ * 串行上传：代理是单实例，十几张图并发打过去更容易超时，超时的代价是白占一格素材库。
+ *
+ * @param {object} client wechat.js 的客户端。
+ * @param {object} store 插件数据层（用 findMaterial / appendMaterial）。
+ * @param {Array<{localPath: string, fileName: string}>} files 选定顺序的图。
+ * @param {{outDir: string, maxEdge: number, timeoutMs: number, config: object}} options
+ * @returns {Promise<{mediaIds: string[], rows: Array, error?: string}>}
+ */
+async function uploadStickerImages(client, store, files, options) {
+  const rows = []
+  const mediaIds = []
+  for (const [index, file] of files.entries()) {
+    const label = `第 ${index + 1} 张（${file.fileName || basename(file.localPath)}）`
+    // 选图阶段已经按内容算过一次 sha：带着它就能先查缓存，命中的图连文件都不必读。
+    // 传 20 张图时，重复推一条改过说明文字的贴图只重传真正变了的那几张。
+    if (String(file.sha ?? '') !== '') {
+      const cached = store.findMaterial({ appid: client.appid, sha: file.sha })
+      if (cached !== null && String(cached.mediaId ?? '') !== '') {
+        mediaIds.push(cached.mediaId)
+        rows.push({ index, fileName: file.fileName, bytes: file.bytes ?? 0, sha: file.sha.slice(0, 12), mediaId: cached.mediaId, uploaded: false, note: '命中缓存，复用已上传的永久素材' })
+        continue
+      }
+    }
+    let buffer
+    try {
+      buffer = readFileSync(file.localPath)
+    } catch (cause) {
+      return { mediaIds, rows, error: `${label} 读不出来：${cause.message}` }
+    }
+    const sha = String(file.sha ?? '') !== '' ? file.sha : createHash('sha256').update(buffer).digest('hex')
+    let payload = buffer
+    let note = `${(buffer.byteLength / 1048576).toFixed(2)}MB 直接上传`
+    if (buffer.byteLength > options.maxBytes) {
+      mkdirSync(options.outDir, { recursive: true })
+      const temp = join(options.outDir, `sticker-${sha.slice(0, 16)}${extname(file.localPath) || '.jpg'}`)
+      writeFileSync(temp, buffer)
+      const compressed = await compressImage(temp, { outDir: options.outDir, maxBytes: options.maxBytes, maxEdge: options.maxEdge, timeoutMs: options.timeoutMs, config: options.config })
+      if (!compressed.ok) {
+        return { mediaIds, rows, error: `${label} ${(buffer.byteLength / 1048576).toFixed(2)}MB 超过永久素材 10MB 上限，自动压缩失败：${compressed.error}` }
+      }
+      payload = readFileSync(compressed.path)
+      note = `${(buffer.byteLength / 1048576).toFixed(2)}MB → ${(compressed.bytes / 1048576).toFixed(2)}MB（JPEG q${compressed.quality} ${compressed.width}×${compressed.height}）`
+    }
+    try {
+      const mediaId = await client.addImageMaterial(payload, file.fileName || basename(file.localPath))
+      store.appendMaterial({ appid: client.appid, sha, mediaId, fileName: file.fileName || basename(file.localPath), bytes: payload.byteLength })
+      mediaIds.push(mediaId)
+      rows.push({ index, fileName: file.fileName, bytes: payload.byteLength, sha: sha.slice(0, 12), mediaId, uploaded: true, note })
+    } catch (cause) {
+      // 已经传上去的图不回滚（素材库没有删除接口可用在这里），但必须说清停在哪一张：
+      // 重推时前面的会命中缓存，只有失败这张会再传一次。
+      return { mediaIds, rows, error: `${label} 上传永久素材失败：${cause.message}${cause.hint ? `｜${cause.hint}` : ''}` }
+    }
+  }
+  return { mediaIds, rows }
+}
+
+/**
  * 内置样稿：只用来验证排版结构（看点卡 / 节标题 / 正文 / 配图 / 金句 / 落款），
  * 内容是中性的占位文字，不含任何人的号名、自我介绍或资料领取文案。
  * `gzh_layout_preview` 默认用它；也可以传自己的 Markdown 来预览真实稿件。
@@ -148,6 +297,11 @@ const CONFIG_HINTS = {
   pythonPath: '压图用的 Python（需 Pillow），留空 = 自动找 DSH 自带 runtime',
   compressTimeoutMs: '单张图压缩超时（毫秒）',
   timeoutMs: '单次微信接口请求超时（毫秒）',
+}
+// 贴图规则的全局档：文案由字段表生成，免得这里写一份「默认 20」而内置默认已经被改了。
+for (const row of STICKER_RULE_FIELDS) {
+  if (row.globalKey === undefined) continue
+  CONFIG_HINTS[row.globalKey] = `贴图形式规范（${row.label}）的全局默认，内置默认 ${DEFAULT_STICKER_RULES[row.key]}；账号 sticker.${row.key} 覆盖它。可配范围 ${row.min}~${row.max}${row.max === WECHAT_STICKER.imageMax || row.max === WECHAT_STICKER.titleMax ? '（上限就是微信硬上限）' : ''}`
 }
 
 /**
@@ -276,11 +430,21 @@ export function registerTools(ctx, deps) {
         skins: skins.map(row => ({ key: row.key, label: row.label, builtIn: row.builtIn, accent: row.colors.accent })),
         accounts: Object.entries(accounts).map(([key, account]) => {
           const resolved = resolveSkin(account.layout ?? cfg().defaultLayout, { custom: store.readSkins() })
+          // 贴图规则一并按「这个号真正会用的数」给出：只回显 sticker 原始值的话，
+          // 面板和模型还是得自己脑补优先级，最容易补出来的错是「号里没写 = 不能少于 6 张」。
+          const sticker = resolveStickerRules({ account: { key, ...account }, config: cfg() })
           return {
             ...store.publicAccount(key, account),
             layout: String(account.layout ?? ''),
             layoutLabel: resolved.skin.label,
             layoutKnown: String(account.layout ?? '') === '' ? null : resolved.name === String(account.layout),
+            sticker: {
+              summary: sticker.summary,
+              values: sticker.rules,
+              sources: sticker.sources,
+              configured: account.sticker ?? null,
+              violations: sticker.violations,
+            },
           }
         }),
         recentPushes: store.readLedger().slice(0, 5),
@@ -290,7 +454,7 @@ export function registerTools(ctx, deps) {
 
   register({
     name: 'gzh_account_set',
-    description: '新建或修改一个公众号账号（合并式，只改传入字段）。字段：name/alias/appid/appsecret/proxyUrl/proxyToken/author/digest/thumbMediaId/contentSourceUrl/layout/skin/eyebrows/foot/tail/enabled/note/comment。layout 填皮肤 key（用 gzh_skin_list 查，内置四套 + 你自己新建的）。comment 是评论区开关 {"open":true,"fansOnly":false}。appsecret 与 proxyToken 按密钥处理：写一次、只回显尾 4 位、传空串删除。',
+    description: `新建或修改一个公众号账号（合并式，只改传入字段）。字段：name/alias/appid/appsecret/proxyUrl/proxyToken/author/digest/thumbMediaId/contentSourceUrl/layout/skin/eyebrows/foot/tail/enabled/note/comment/sticker。layout 填皮肤 key（用 gzh_skin_list 查，内置四套 + 你自己新建的）。comment 是评论区开关 {"open":true,"fansOnly":false}。sticker 是**这个号的贴图形式规范**：{"minImages":6,"maxImages":20,"titleMax":20,"textMax":1000,"coverFirst":true}，也是块内合并（只改 minImages 不会把 titleMax 悄悄抹回默认）。它是 gzh_push_sticker 的长期口径，改在这里面板才会跟着变；只放宽某一次请用 push 参数。合法范围见 sticker 字段说明，越界或不认识的键会在写入前直接报错（不会存进去一半）。appsecret 与 proxyToken 按密钥处理：写一次、只回显尾 4 位、传空串删除。`,
     parameters: {
       account: { type: 'string', required: true, description: '账号 key，小写字母数字与 -/_，例如 my-gzh。推送时用它选号。' },
       name: { type: 'string', description: '账号显示名，例如 我的日更号。' },
@@ -299,7 +463,7 @@ export function registerTools(ctx, deps) {
       proxyUrl: { type: 'string', description: '微信接口代理根地址，例如 https://proxy.example.com/wxproxy（请一定用 https：appsecret 与 proxyToken 会经过这个地址）。留空 = 直连 api.weixin.qq.com（需 allowDirectApi 且本机 IP 已加白名单）。' },
       proxyToken: { type: 'string', description: '代理鉴权令牌，放进请求头 X-Proxy-Token。只写不回显。' },
       author: { type: 'string', description: '默认作者。push 时没给 author 就用它；两者都空会 fail-close。' },
-      digest: { type: 'string', description: '默认摘要（≤120 字）。' },
+      digest: { type: 'string', description: `默认摘要（≤${WECHAT_STICKER.digestMax} 字）。` },
       thumbMediaId: { type: 'string', description: '默认封面素材 media_id。' },
       contentSourceUrl: { type: 'string', description: '「阅读原文」链接。' },
       layout: { type: 'string', description: '排版皮肤 key（gzh_skin_list 可查）。留空 = 用全局 defaultLayout。' },
@@ -307,6 +471,19 @@ export function registerTools(ctx, deps) {
       eyebrows: { type: 'array', items: { type: 'string' }, description: '每节小标签序列，例如 ["INSIGHT","WHY","ACTION"]；传 ["none"] 表示不加。' },
       foot: { type: 'object', additionalProperties: true, description: '落款：{"intro":"我是 …","cta":"点赞、在看、转发","closing":"我们下篇见。"}' },
       tail: { type: 'object', additionalProperties: true, description: '文末「资料领取」：{"title":"资料领取","body":"后台回复关键词「XX」领取 …"}' },
+      comment: { type: 'object', additionalProperties: true, description: '评论区默认开关：{"open":true,"fansOnly":false}。单次推送的 commentOpen / commentFansOnly 覆盖它。' },
+      sticker: {
+        type: 'object',
+        additionalProperties: true,
+        description: `该号的贴图形式规范（gzh_push_sticker 长期口径，块内合并）：{"minImages":6,"maxImages":20,"titleMax":20,"textMax":1000,"coverFirst":true}。minImages/maxImages ${WECHAT_STICKER.imageMin}~${WECHAT_STICKER.imageMax}（${WECHAT_STICKER.imageMax} 就是微信硬上限，配不出更高的）；titleMax 1~${WECHAT_STICKER.titleMax}；textMax 0~5000（0 = 这个号发纯图贴图，说明必须留空）；coverFirst=false 表示首图自己就是封面，不把工作台的 cover 挪到第一位。想按号放宽的合理理由是这个号的形式确实不是 ${DEFAULT_RULE_PROSE}，不是「这条稿子凑不够」。`,
+        properties: {
+          minImages: { type: 'integer', minimum: WECHAT_STICKER.imageMin, maximum: WECHAT_STICKER.imageMax, description: '每条贴图最少几张图。' },
+          maxImages: { type: 'integer', minimum: WECHAT_STICKER.imageMin, maximum: WECHAT_STICKER.imageMax, description: `每条贴图最多几张图（天花板 ${WECHAT_STICKER.imageMax} = 微信硬上限）。` },
+          titleMax: { type: 'integer', minimum: 1, maximum: WECHAT_STICKER.titleMax, description: `标题字数上限（≤${WECHAT_STICKER.titleMax}，微信硬上限）。` },
+          textMax: { type: 'integer', minimum: 0, maximum: 5000, description: '说明字数上限；0 = 说明必须留空。' },
+          coverFirst: { type: 'boolean', description: 'true = 把工作台登记的 cover 当第一张（封面）。' },
+        },
+      },
       enabled: { type: 'boolean', description: 'false = 停用该号（推送时直接拒）。' },
       note: { type: 'string', description: '备注，例如出口 IP、号主体。' },
     },
@@ -315,9 +492,13 @@ export function registerTools(ctx, deps) {
       // appsecret / proxyToken 是密钥：落盘可以，回显只留尾 4 位（publicAccount 负责掩码）。
       const saved = store.writeAccount(key, patch)
       const touched = ['appsecret', 'proxyToken'].filter(field => Object.prototype.hasOwnProperty.call(patch, field))
+      // 改完立刻回显**生效值**（含来源层）：贴图的闸门按生效值跑，让人确认「我到底改成了什么」，
+      // 而不是让人再调一次 gzh_account_list 去猜合并后的结果。
+      const effective = resolveStickerRules({ account: { key, ...saved }, config: cfg() })
       return {
         ok: true,
         account: saved,
+        sticker: { summary: effective.summary, values: effective.rules, sources: effective.sources, violations: effective.violations },
         file: store.accountsFile,
         wrote: Object.keys(patch),
         secretFields: touched.length === 0 ? [] : touched.map(field => `${field}（已写入，不再回显；传空串可删除）`),
@@ -398,7 +579,7 @@ export function registerTools(ctx, deps) {
 
   register({
     name: 'gzh_config_get',
-    description: '读插件全局参数（enabled/defaultAccount/defaultLayout/mediaDeskDir/dataDir/autoDigest/allowDirectApi/maxImageMb/imageMaxEdge/pythonPath/timeoutMs）、各数据文件位置、以及压图引擎是否可用。这些参数不在这里改——它们在宿主「插件详情页 → 配置」里；本工具只读，给面板和排障用。',
+    description: '读插件全局参数（enabled/defaultAccount/defaultLayout/mediaDeskDir/dataDir/autoDigest/allowDirectApi/maxImageMb/imageMaxEdge/pythonPath/timeoutMs，以及贴图形式规范的全局默认 stickerMinImages/stickerMaxImages/stickerTitleMax/stickerTextMax）、各数据文件位置、以及压图引擎是否可用。这些参数不在这里改——它们在宿主「插件详情页 → 配置」里；本工具只读，给面板和排障用。',
     parameters: {},
     async execute() {
       const config = cfg()
@@ -1047,12 +1228,499 @@ export function registerTools(ctx, deps) {
   })
 
   register({
-    name: 'gzh_draft_verify',
-    description: '回读该号的草稿箱，验证刚推的草稿在不在、标题对不对（对齐产线 wechat_readback.py 的判据）。给了 mediaId 就精确找它，否则列最近 N 条给人对照。',
+    name: 'gzh_push_sticker',
+    description: `把一组图推成**贴图**（图片消息，article_type=newspic）草稿。这是与 gzh_push_draft 平行的一条链路，不是它的一个开关：贴图**没有排版**（官方只支持纯文本，皮肤/落款/资料领取/看点卡一概用不上），也**没有独立封面**——\`image_list\` 第一张就是封面，微信建成后会自己回填 thumb_media_id。图默认取自**自媒体工作台条目**的配图（它登记的 cover 排第一张当封面，\`includeCover=false\` 关掉），也可以直接传 images 给一组本地图片路径。**每张图都要上传成永久图片素材**（占素材库一格，插件按「号+图片内容」缓存，同一张图同一个号只传一次；名额体检见 gzh_material_audit）。
+**形式规范是可配置的**，默认 ${DEFAULT_RULE_PROSE}；生效优先级：本次调用参数（minImages/maxImages/titleMax/textMax）> 账号 \`sticker\` 块（gzh_account_set，长期口径）> 宿主插件配置 stickerXxx（全局）> 内置默认。返回值里的 \`rules\` 会写清每个数**从哪一层来**——被拦时先读它再决定改哪。改配置的理由应当是「这个号的形式本来就不是 6 张」，而不是「这条稿子凑不够图」：后者是稿子没做完。
+**微信硬上限不可配、force 也绕不过**：标题 ${WECHAT_STICKER.titleMax} 字（图文才是 64）、一次 ${WECHAT_STICKER.imageMin}~${WECHAT_STICKER.imageMax} 张图、正文只支持纯文本。形式规范可被 force=true + reason 绕过。
+说明里**不许出现图片**（图片标记、图片路径、站外链接都拦）。不传 cover_info，裁剪比例交给微信算（自己算坐标会撞 53401）。先用 planOnly=true 看一遍选图、文案、生效规则与「会净增几格素材」，再真推。同标题/同内容会拦，绕过要 force+reason。`,
+    parameters: {
+      account: { type: 'string', required: true, description: '推到哪个号。' },
+      itemId: { type: 'string', description: '自媒体工作台条目 id：贴图就用它的配图（cover 当第一张）。与 images 至少要给一个。' },
+      images: { type: 'array', items: { type: 'string' }, description: '直接给一组本地图片路径，顺序就是展示顺序、第一张当封面。给了就完全用它，不再读条目配图。' },
+      includeCover: { type: 'boolean', description: 'itemId 来源时，是否把条目登记的 cover 放在第一张当封面。不传 = 用账号 sticker.coverFirst（内置默认 true）；false = 首图自己就是封面（配图成套的日更形式）。' },
+      coverIndex: { type: 'number', description: '把选中的第 N 张（1 基，排除之后数）挪到第一张当封面。用于「图都在，但首图不对」；重排会改变这条贴图的身份（去重按顺序算）。' },
+      dropImages: { type: 'array', items: { type: 'string' }, description: '从这次要发的图里排除哪几张：填 1 基序号或文件名（如 "3"、"cover.png"）。用于「条目里混了一张不能发的」，比手抄一遍剩下的路径省事。' },
+      title: { type: 'string', description: '标题。字数上限见返回的 rules.titleMax（默认 20，微信硬上限 32，图文才是 64）。不传用条目标题；超了会被拒，不截断。' },
+      content: { type: 'string', description: '贴图说明（纯文本）。字数上限见 rules.textMax（默认 1000）。不传则把条目正文洗成纯文本（去掉 Markdown 标记、HTML 标签、图片引用，链接只留文字）。说明里不许出现图片标记、图片路径或站外链接。' },
+      noText: { type: 'boolean', description: 'true = 就是要一张说明文字都没有的纯图贴图。默认不给空文字，防止洗文案洗空了还闷头推出去。' },
+      digest: { type: 'string', description: `摘要（≤${WECHAT_STICKER.digestMax} 字）。不传用账号默认；再没有就不传，让微信自己取说明前 54 字。` },
+      minImages: { type: 'number', description: `只对本次生效的图数下限（1~${WECHAT_STICKER.imageMax}）。临时放宽用它，长期口径请写进账号 sticker.minImages——否则面板和产线看到的规则还是老的。` },
+      maxImages: { type: 'number', description: `只对本次生效的图数上限（默认取生效规则，天花板 ${WECHAT_STICKER.imageMax} 张就是微信上限）。选中的图多于它会被拒，不会静默丢掉后面的。` },
+      titleMax: { type: 'number', description: `只对本次生效的标题字数上限（1~${WECHAT_STICKER.titleMax}，微信硬上限 ${WECHAT_STICKER.titleMax}）。` },
+      textMax: { type: 'number', description: '只对本次生效的说明字数上限（0~5000）。填 0 = 这次就是要没有说明。' },
+      planOnly: { type: 'boolean', description: 'true = 只列「会用哪些图、标题、说明、生效规则、会净增几格素材、去重结果」，不联网、不上传、不建草稿。先看一眼再推。' },
+      commentOpen: { type: 'boolean', description: '这条是否开放评论；不传用账号的 comment.open（默认开放）。' },
+      commentFansOnly: { type: 'boolean', description: '这条是否仅关注者可评论；不传用账号的 comment.fansOnly（默认不限）。' },
+      checkDraftBox: { type: 'boolean', description: '推前回读草稿箱最近 20 条查同名草稿，默认 true。离线调试或代理慢可传 false。' },
+      force: { type: 'boolean', description: 'true = 明知重复（本地台账 / 草稿箱同名 / 说明里有外链 / 说明过长 / 图数不够）仍推，必须带 reason。' },
+      reason: { type: 'string', description: 'force=true 时必填：为什么要绕过这道闸。' },
+    },
+    async execute(args) {
+      const account = resolveAccount(args.account, { needSecret: true })
+      // 生效规则先算：后面每一道闸的文案都要引用它（数 + 来源），拦下来才说得出「改哪里」。
+      const ruleSet = resolveStickerRules({ account, args, config: cfg() })
+      const { rules, sources } = ruleSet
+      const violations = [...ruleSet.violations]
+      // includeCover 是 coverFirst 的调用档别名（老参数名不能废，产线脚本在用）。
+      if (args.includeCover !== undefined) {
+        rules.coverFirst = args.includeCover === true
+        sources.coverFirst = '本次调用 includeCover'
+      }
+      const wantedItem = String(args.itemId ?? '').trim()
+      const explicit = Array.isArray(args.images)
+        ? args.images.map(path => String(path ?? '')).map(path => path.trim()).filter(path => path !== '')
+        : []
+      if (wantedItem === '' && explicit.length === 0) {
+        throw fail('不知道该用哪些图', '传 itemId（用自媒体工作台条目的配图，gzh_media_desk action=list 可查），或传 images 给一组本地图片路径')
+      }
+
+      // 条目只读一次：选图、标题、说明三处都要用它，读三遍既慢，还可能读到不同版本。
+      // requireBody=false：贴图要的是配图，一条图配几句话的贴图稿可能压根没写长正文，
+      // 拿图文的「正文 > 80 字」标准拦它，等于变相不让发贴图。
+      const item = wantedItem === '' ? null : desk.read(wantedItem, { requireBody: false })
+
+      // ---- 选图：贴图的全部信息量都在图上，选错图比选错排版严重得多 ----
+      const picked = []
+      const skipped = []
+      // 警告从选图一路攒到文案：面板、台账、返回值三处看的都是同一串，别中途换数组。
+      const warnings = []
+      const digestOf = path => createHash('sha256').update(readFileSync(path)).digest('hex')
+      if (explicit.length > 0) {
+        for (const path of explicit) {
+          if (!existsSync(path) || !statSync(path).isFile()) {
+            skipped.push({ src: path, source: 'images 参数', note: '本地没有这个文件' })
+            continue
+          }
+          picked.push({
+            localPath: path, fileName: basename(path), bytes: statSync(path).size,
+            sha: digestOf(path), caption: '', source: 'images 参数',
+          })
+        }
+      } else {
+        // cover 当第一张：贴图的第一张图就是列表里的封面，而工作台恰恰已经把「这张稿子的
+        // 封面长什么样」记下来了（橘有据那种固定封面形式尤其对得上）。
+        // 关不关这个动作由生效规则说（账号可以配成「首图自己就是封面」），文案里带出处。
+        const queue = []
+        if (rules.coverFirst) {
+          if (item.cover === null) skipped.push({ src: '', source: '工作台 cover', note: '这条没登记 cover，第一张配图将充当封面' })
+          else queue.push({ entry: item.cover, source: '工作台 cover（当封面）' })
+        } else {
+          warnings.push(`没把工作台的 cover 单独挪到第一位（${sources.coverFirst || '账号 sticker.coverFirst'}）：第一张配图就是封面`)
+        }
+        for (const entry of item.images) queue.push({ entry, source: '工作台配图' })
+        for (const { entry, source } of queue) {
+          if (entry.kind === 'remote') {
+            skipped.push({ src: entry.src, source, note: '外链图片：贴图要的是永久素材 media_id，得先把图落到本地' })
+            continue
+          }
+          if (entry.localPath === '') {
+            skipped.push({ src: entry.src, source, note: entry.note === '' ? '本地素材不存在' : entry.note })
+            continue
+          }
+          picked.push({
+            localPath: entry.localPath, fileName: entry.fileName, bytes: entry.bytes,
+            sha: digestOf(entry.localPath), caption: entry.caption, source,
+          })
+        }
+      }
+      if (picked.length === 0) {
+        throw fail('一张能用的图都没有', `跳过的 ${skipped.length} 张：\n${skipped.map(row => `${row.src || '（无）'} —— ${row.note}`).join('\n') || '（没有跳过记录，说明选图清单是空的）'}`)
+      }
+
+      // ---- 排除与封面挪位：先动集合，再谈张数（闸门要管的是最终真要发的那几张） ----
+      // 支持填序号也支持填文件名：面板手里有文件名，模型看计划也是照名字指认，抄路径太容易错。
+      const dropRaw = Array.isArray(args.dropImages) ? args.dropImages.map(row => String(row ?? '').trim()).filter(row => row !== '') : []
+      const dropped = []
+      if (dropRaw.length > 0) {
+        const rest = []
+        for (const want of dropRaw) {
+          const index = /^\d+$/.test(want) ? Number(want) : 0
+          const hit = index > 0
+            ? (index >= 1 && index <= picked.length ? picked[index - 1] : undefined)
+            : picked.find(row => row.fileName.toLowerCase() === want.toLowerCase())
+          if (hit === undefined) {
+            // 排除没排掉是危险方向：用户以为那张图没了。宁可报错，也不发一条「本该排掉」的贴图。
+            throw fail(
+              `dropImages 里的「${want}」对不上这次的任何一张图`,
+              `现在选中的是（1 基）：${picked.map((row, i) => `${i + 1}.${row.fileName}`).join('、')}；被排除过的：${dropped.map(row => row.fileName).join('、') || '（无）'}`,
+            )
+          }
+          picked.splice(picked.indexOf(hit), 1)
+          dropped.push({ fileName: hit.fileName, reason: `dropImages=${want}` })
+        }
+        if (picked.length === 0) throw fail('排除后一张图都不剩', 'dropImages 少排几张，或者干脆换一批图（images / itemId）')
+      }
+      // coverIndex 不走 numArg：它会把越界值悄悄夹到边界，等于把「指错封面」变成「随机选一张封面」。
+      const coverRaw = args.coverIndex === undefined || args.coverIndex === null ? '' : String(args.coverIndex).trim()
+      let coverIndex = 0
+      if (coverRaw !== '') {
+        const want = Number(coverRaw)
+        if (!Number.isInteger(want) || want < 1 || want > picked.length) {
+          throw fail(
+            `coverIndex=${coverRaw} 不在范围内`,
+            `这次要发 ${picked.length} 张图，coverIndex 填 1~${picked.length}（1 基，按 dropImages 排除之后的顺序数；不填就是第一张当封面）`,
+          )
+        }
+        coverIndex = want
+      }
+      if (coverIndex > 1) {
+        const [promoted] = picked.splice(coverIndex - 1, 1)
+        picked.unshift(promoted)
+        warnings.push(`封面换成了第 ${coverIndex} 张「${promoted.fileName}」（coverIndex）；顺序变了，这条贴图在台账里就是新的一条（去重按顺序算）`)
+      }
+
+      // ---- 张数：先上限（微信的天花板）再下限（我们的口径），文案里两档都要出现 ----
+      if (picked.length > rules.maxImages) {
+        throw fail(
+          `选中 ${picked.length} 张图，超过这次允许的 ${rules.maxImages} 张（来自${sources.maxImages || '内置默认'}；微信贴图硬上限 ${WECHAT_STICKER.imageMax} 张）`,
+          rules.maxImages >= WECHAT_STICKER.imageMax
+            ? `挑出真正要发的 ≤${WECHAT_STICKER.imageMax} 张（images 显式列出来，或 dropImages 排掉几张），或者分两条贴图发`
+            : `少挑几张；要长期放宽就调该层的 maxImages（天花板仍是微信的 ${WECHAT_STICKER.imageMax} 张），只放宽这一次用 maxImages 参数`,
+        )
+      }
+      // 图数下限是我们自己定的规范（微信 1 张就发得出去），所以文案里要讲清「凭什么拦你」，
+      // 并且指条明路：凑不齐通常是这条稿子还没配够图，不是贴图不该发；而这个号本来就该少，那是配置问题。
+      if (picked.length < rules.minImages) {
+        const source = sources.minImages || '内置默认'
+        if (args.force !== true) {
+          throw fail(
+            `只有 ${picked.length} 张能用的图，少于每条贴图要求的 ${rules.minImages} 张（来自${source}；微信 ${WECHAT_STICKER.imageMin} 张就发得出去，所以这是我们自己的闸门）`,
+            source === '本次调用参数'
+              ? '这一档是你这次自己传 minImages 定的：把图补上，或把参数改回这个号的常态；确实要发带 force=true 和 reason'
+              : `先分清是哪一种：稿子没配够图 → 补到 ${rules.minImages} 张再推；这个号的形式本来就不是 ${rules.minImages} 张（比如单图消息）→ 用 gzh_account_set 给该号配 sticker.minImages（面板 设置→账号→贴图规则），别每天勾 force 绕闸门。只放宽这一次：带 minImages 参数；临时插播：force=true + reason`,
+          )
+        }
+        warnings.push(`只有 ${picked.length} 张图，不到规范 ${rules.minImages} 张（force 放行；这个号常态如此的话去改 sticker.minImages，别老勾 force）`)
+      }
+
+      // ---- 标题：字数上限是可配的规范（微信硬上限 32，图文才是 64），绝不照搬图文那档 ----
+      const title = (String(args.title ?? '').trim() !== '' ? String(args.title).trim() : String(item?.title ?? '').trim())
+      if (title === '') throw fail('缺少标题', '传 title，或者用带标题的 itemId')
+      if (textLength(title) > WECHAT_STICKER.titleMax) {
+        // 这一档没有 force 可绕：超 32 字微信自己就拒，放过去只是把清楚的理由换成一条看不懂的 45166。
+        throw fail(
+          `标题 ${textLength(title)} 字，超过微信给贴图标题的硬上限 ${WECHAT_STICKER.titleMax} 字（图文才是 64 字）`,
+          '这一档绕不过去（force 也不行）：删到 32 字内；标题确实要长就改走 gzh_push_draft 推图文',
+        )
+      }
+      if (textLength(title) > rules.titleMax) {
+        if (args.force !== true) {
+          throw fail(
+            `标题 ${textLength(title)} 字，超过贴图规范的 ${rules.titleMax} 字（来自${sources.titleMax || '内置默认'}；微信给贴图的硬上限是 ${WECHAT_STICKER.titleMax} 字，图文才是 64 字）`,
+            `贴图标题短才不会在信息流里折行：删到 ${rules.titleMax} 字内；这个号的贴图标题常态就是更长 → gzh_account_set 配 sticker.titleMax（上限仍是微信的 ${WECHAT_STICKER.titleMax}）；只放宽这一次 → titleMax 参数；标题本来就该长，说明这篇更适合走 gzh_push_draft 推图文`,
+          )
+        }
+        warnings.push(`标题 ${textLength(title)} 字，超过了规范 ${rules.titleMax} 字（force 放行，微信硬上限 ${WECHAT_STICKER.titleMax} 字之内）`)
+      }
+
+      // ---- 说明文字：只能是纯文本 ----
+      let text = String(args.content ?? '').trim()
+      let textFrom = text === '' ? '' : 'content 参数'
+      let deskMarkdownBytes = 0
+      if (text === '' && item !== null) {
+        deskMarkdownBytes = item.markdownBytes
+        text = plainTextFromMarkdown(item.markdown)
+        textFrom = text === '' ? '' : `条目正文（${deskMarkdownBytes} 字节 Markdown）洗成的纯文本`
+      }
+      if (text === '' && args.noText !== true) {
+        throw fail('贴图说明是空的', '传 content，或者用有正文的 itemId 让插件洗出说明；确实要推一条完全没有文字的纯图贴图，带 noText=true')
+      }
+      if (text === '') warnings.push('noText=true：这条贴图没有说明文字（官方文档写 content 必填，微信若报正文缺失，就补一句再推）')
+      // 贴图放宽了「条目必须有正文」这道门（图配几句话本来就是贴图），但放宽不等于不看：
+      // 说明只有几十个字时提醒一句，别把工作台里还没定稿的一段当成成稿推出去。
+      if (item !== null && text !== '' && item.markdownBytes <= 80) warnings.push(`工作台里这条正文只有 ${item.markdownBytes} 字节（贴图不受「正文太短」限制），说明文字就是从它洗出来的，推前扫一眼`)
+      if (skipped.length > 0) warnings.push(`跳过了 ${skipped.length} 张图：${skipped.map(row => `${row.src || '（无）'}（${row.note}）`).join('；')}`)
+      const captions = picked.filter(row => row.caption !== '').length
+      if (captions > 0) warnings.push(`${captions} 张图带图片说明（caption），但贴图没有「每张图一行说明」的位置，它们不会出现在草稿里`)
+      if (text !== '' && textFrom.includes('洗成')) warnings.push(`说明文字是从 Markdown 洗出来的（${textLength(text)} 字），建议扫一眼有没有残留的符号或断行` + (deskMarkdownBytes > 4000 ? '；原文很长，贴图放不下这么多字，该推图文' : ''))
+
+      const textFindings = text === '' ? [] : auditStickerText(text)
+      if (textFindings.length > 0 && args.force !== true) {
+        const label = { image: '图片标记', path: '图片路径', link: '站外链接' }
+        throw fail(
+          `贴图说明里有 ${textFindings.length} 处不能推的东西：\n${textFindings.slice(0, 5).map(row => `${label[row.kind] ?? row.kind} 「${row.value}」 —— ${row.why}`).join('\n')}`,
+          '贴图正文只有纯文本：链接删掉或改成截图，图片一律走配图（images / 工作台条目），别写进说明；确认这些都能留，就带 force=true 和 reason',
+        )
+      }
+      if (textLength(text) > rules.textMax && args.force !== true) {
+        if (rules.textMax === 0) {
+          // 这一档不是「写长了」，是「这个号压根不写说明」——文案得把这两件事分开说，
+          // 否则用户看到的是「超过 0 字」这种莫名其妙的报错。
+          throw fail(
+            `这个号的贴图形式是纯图不写说明（textMax=0，来自${sources.textMax || '内置默认'}），这次带了 ${textLength(text)} 字说明`,
+            '纯图贴图就别传 content（面板勾「不要说明文字」＝noText=true）；这篇确实要写说明 → 用 textMax 参数临时放宽，或 gzh_account_set 改 sticker.textMax；确实按现在这样推就带 force=true 和 reason',
+          )
+        }
+        throw fail(
+          `贴图说明 ${textLength(text)} 字，超过 ${rules.textMax} 字（来自${sources.textMax || '内置默认'}；微信这一档没公开硬上限，所以完全按我们的口径）`,
+          '贴图在信息流里就是一张图配几句话：删短，或者这篇该走 gzh_push_draft 推图文；这个号常态说明更长 → gzh_account_set 配 sticker.textMax；只放宽这一次 → textMax 参数；确实要推就带 force=true 和 reason',
+        )
+      }
+
+      let digest = String(args.digest ?? '').trim()
+      let digestFrom = digest === '' ? '' : 'push 参数'
+      if (digest === '' && String(account.digest ?? '').trim() !== '') {
+        digest = String(account.digest).trim()
+        digestFrom = '账号默认摘要'
+      }
+      if (digest !== '' && textLength(digest) > WECHAT_STICKER.digestMax) digest = clampText(digest, WECHAT_STICKER.digestMax)
+
+      // ---- 素材名额与重复图：只看本地台账，planOnly 也一次网络都不发 ----
+      // 每张图都会在号的永久素材库里占一格，而且是**长期**占：贴图做得多了，素材库比草稿箱先满。
+      // 这里给的是「本插件台账口径」——产线脚本传的图看不见，所以它是下界，要准数走 gzh_material_audit。
+      const sha12 = picked.map(row => row.sha.slice(0, 12))
+      const trackedMaterials = store.readMaterials().filter(row => row.appid === account.appid)
+      const trackedShas = new Set(trackedMaterials.map(row => row.sha))
+      const alreadyUploaded = picked.filter(row => trackedShas.has(row.sha)).length
+      const quota = {
+        trackedImages: trackedMaterials.length,
+        alreadyUploaded,
+        netNew: picked.length - alreadyUploaded,
+        note: `本插件为这个号上传过 ${trackedMaterials.length} 张永久素材；这次 ${picked.length} 张里 ${alreadyUploaded} 张已占格，净增 ${picked.length - alreadyUploaded} 格。台账口径，产线传的图不计入，准数用 gzh_material_audit`,
+      }
+      // 同一张图在同一个号上反复出现，多半是拿旧条目当模板时没换图。不拦（同一张图复用是
+      // 省钱的正解），但要说出来：草稿箱里两条贴图长得一模一样，通常是事故而不是设计。
+      const ledger = store.readLedger()
+      const stickerLedger = ledger.filter(row => row.account === account.key && row.articleType === 'newspic' && Array.isArray(row.imageShas))
+      const repeatImages = []
+      picked.forEach((row, index) => {
+        const hits = stickerLedger.filter(entry => entry.imageShas.includes(row.sha.slice(0, 12)))
+        if (hits.length === 0) return
+        repeatImages.push({
+          fileName: row.fileName, position: index + 1, sha: row.sha.slice(0, 12),
+          times: hits.length, lastPushedAt: hits[0].at ?? null, lastMediaId: hits[0].mediaId ?? null,
+        })
+      })
+      if (repeatImages.length > 0) {
+        warnings.push(`${repeatImages.length} 张图和这个号以前推过的贴图重复：${repeatImages.slice(0, 4).map(row => `${row.fileName}（${row.times} 次${row.lastPushedAt ? `，最近 ${row.lastPushedAt}` : ''}）`).join('；')}${repeatImages.length > 4 ? '…' : ''}。复用图本身省钱，但两条贴图几乎一样时通常该换图` + (repeatImages.length > alreadyUploaded ? '；重复不等于不占格以外的成本——没传过的还是会净增素材' : ''))
+      }
+
+      const imageKey = sha12.join(',')
+      const fp = store.fingerprint({ account: account.key, title, content: `${text}\n图:${imageKey}` })
+      const prior = store.readLedger().find(entry => entry.fingerprint === fp)
+      if (prior !== undefined && args.force !== true) {
+        throw fail(`这条贴图已经推过一次（${prior.at}，草稿 media_id=${prior.mediaId}）`, '重复草稿是线上事故。确认要再推一份，就带 force=true 和 reason')
+      }
+      if (args.force === true && String(args.reason ?? '').trim() === '') throw fail('force=true 必须带 reason', '写清为什么要绕过这道闸')
+
+      const plan = {
+        account: account.key,
+        articleType: 'newspic',
+        // 面板拿它对一下「这份计划还是不是当前选中的条目」，换了文章不能拿旧计划直接推。
+        itemId: item?.id ?? '',
+        title,
+        titleChars: textLength(title),
+        content: text,
+        contentFrom: textFrom || (args.noText === true ? '无说明文字（noText）' : ''),
+        digest: digest || null,
+        digestFrom: digestFrom || '不传，微信取说明前 54 字',
+        images: picked.map((row, index) => ({
+          fileName: row.fileName, bytes: row.bytes, sha: row.sha.slice(0, 12), source: row.source,
+          localPath: row.localPath, position: index + 1, isCover: index === 0,
+        })),
+        skipped,
+        droppedImages: dropped,
+        // 生效规则与来源：面板按它渲染（不再自己写死 6 张/20 字），人和模型被拦时看它才知道改哪一层。
+        rules: {
+          summary: ruleSet.summary,
+          values: { minImages: rules.minImages, maxImages: rules.maxImages, titleMax: rules.titleMax, textMax: rules.textMax, coverFirst: rules.coverFirst },
+          sources,
+          hard: { images: `${WECHAT_STICKER.imageMin}~${WECHAT_STICKER.imageMax}`, title: WECHAT_STICKER.titleMax, digest: WECHAT_STICKER.digestMax },
+          violations,
+          editable: STICKER_RULE_FIELDS.map(row => ({
+            key: row.key, label: row.label, min: row.min, max: row.max,
+            type: row.type ?? 'number', hint: row.hint, globalKey: row.globalKey ?? null,
+          })),
+        },
+        quota,
+        repeatImages,
+        warnings,
+        duplicateOf: prior === undefined ? null : { at: prior.at, mediaId: prior.mediaId },
+      }
+      // planOnly：一行网络都不发。选图与文案在这里看明白，比推完再去后台删省事得多——
+      // 每张图都会占一格永久素材库，上传前是唯一还能反悔的时机。
+      if (args.planOnly === true) {
+        return {
+          ok: true, planOnly: true, plan,
+          next: `确认无误后去掉 planOnly 真推：这次净增 ${quota.netNew} 格永久素材（同号同图只传一次），图数按「${ruleSet.summary}」（来源 ${Object.entries(sources).map(([key, from]) => `${key}←${from}`).join('、')}）`,
+        }
+      }
+
+      const client = createClient({
+        baseUrl: account.proxyUrl, token: account.proxyToken,
+        appid: account.appid, secret: account.appsecret, timeoutMs: cfg().timeoutMs,
+      })
+
+      // ---- 草稿箱同名：台账只记得本插件推过的，产线/后台推的看不见 ----
+      let draftBox = { checked: false, hits: [], error: '' }
+      if (args.checkDraftBox !== false) {
+        try {
+          const norm = value => String(value ?? '').replace(/\s+/g, '')
+          const drafts = await client.listDrafts(0, 20)
+          draftBox = {
+            checked: true,
+            hits: drafts.filter(entry => norm(entry.title) === norm(title))
+              .map(entry => ({ mediaId: entry.mediaId, title: entry.title, articleType: entry.articleType, updatedAt: entry.updatedAt ?? null })),
+            error: '',
+          }
+        } catch (cause) {
+          draftBox = { checked: false, hits: [], error: cause.message }
+        }
+        if (draftBox.checked && draftBox.hits.length > 0 && args.force !== true) {
+          throw fail(
+            `草稿箱里已经有 ${draftBox.hits.length} 条同名草稿：${draftBox.hits.map(hit => `${hit.mediaId}（${hit.title}｜${hit.articleType === 'newspic' ? '贴图' : '图文'}）`).join('、')}`,
+            '本插件的台账只记得自己推过的，产线/后台推的看不见。要么先去后台删掉旧草稿，要么确认要再建一条就带 force=true 和 reason',
+          )
+        }
+      }
+
+      // ---- 上传永久素材 ----
+      const uploaded = await uploadStickerImages(client, store, picked, {
+        outDir: join(store.outDir, 'sticker'),
+        maxBytes: WECHAT_STICKER.materialMaxBytes,
+        maxEdge: numArg(cfg().imageMaxEdge, 1440, 320, 4096),
+        timeoutMs: numArg(cfg().compressTimeoutMs, 120_000, 10_000, 600_000),
+        config: cfg(),
+      })
+      // 三处台账都带上 imageShas 与当次的规则快照：前者让下一次 plan 能认出「这张图这个号
+      // 发过」，后者让半年后还能回答「当时是按什么口径放行的」——规则可以改，台账不能改。
+      const ruleSnapshot = { minImages: rules.minImages, maxImages: rules.maxImages, titleMax: rules.titleMax, textMax: rules.textMax }
+
+      if (uploaded.error !== undefined) {
+        // 已经传上去的不回收（素材库没有可用的删除口），但缓存已经记下，重推只会再传失败这张。
+        store.appendLedger({ fingerprint: fp, account: account.key, articleType: 'newspic', title, mediaId: null, error: uploaded.error, endpoint: client.endpoint, uploadedBeforeFail: uploaded.rows.length, images: picked.length, imageKey, imageShas: sha12, stickerRules: ruleSnapshot })
+        throw fail(uploaded.error, `停在这之前已上传 ${uploaded.rows.length} 张（都记进素材缓存了，重推会复用，不会重复占名额）。materials.json：${store.materialsFile}`)
+      }
+
+      let mediaId = ''
+      try {
+        mediaId = await client.addStickerDraft({
+          title, content: text, imageMediaIds: uploaded.mediaIds,
+          digest: digest === '' ? undefined : digest,
+          comment: commentSetting(account, args),
+        })
+      } catch (cause) {
+        store.appendLedger({ fingerprint: fp, account: account.key, articleType: 'newspic', title, mediaId: null, error: cause.message, hint: cause.hint ?? '', endpoint: client.endpoint, imageKey, imageShas: sha12, stickerRules: ruleSnapshot, images: uploaded.mediaIds.length, digest, digestFrom })
+        throw fail(cause.message, `${cause.hint ?? ''} 先别重推：用 gzh_draft_verify（articleType=newspic）回读看草稿箱里到底有没有建出来。`)
+      }
+
+      store.appendLedger({
+        fingerprint: fp, account: account.key, articleType: 'newspic', title, mediaId,
+        endpoint: client.endpoint, images: uploaded.mediaIds.length, coverImage: picked[0].fileName,
+        imageKey, imageShas: sha12, stickerRules: ruleSnapshot, imageMediaIds: uploaded.mediaIds, textChars: textLength(text), digest, digestFrom,
+        forced: args.force === true, reason: args.reason ?? '',
+        draftBox: draftBox.hits, warnings,
+      })
+      return {
+        ok: true,
+        mediaId,
+        account: account.key,
+        articleType: 'newspic',
+        title,
+        cover: { from: picked[0].source, fileName: picked[0].fileName, mediaId: uploaded.mediaIds[0] },
+        images: uploaded.rows,
+        content: text,
+        contentFrom: textFrom || '无说明文字（noText）',
+        digest: digest || null,
+        digestFrom: digestFrom || '不传，微信取说明前 54 字',
+        uploadedNow: uploaded.rows.filter(row => row.uploaded).length,
+        reused: uploaded.rows.filter(row => !row.uploaded).length,
+        // 推完也要能回答「按什么口径推的、这次占了几格」——和 plan 里同一份，不必再去 planOnly 跑一遍。
+        rules: plan.rules,
+        quota,
+        warnings,
+        next: '用 gzh_draft_verify 回读（带 articleType="newspic"：贴图与图文在草稿箱里同表存放，只比标题发现不了串型）',
+      }
+    },
+  })
+
+  register({
+    name: 'gzh_material_audit',
+    description: '看某个号的**永久图片素材**占用：本插件上传台账（materials.json，按「号+图片内容」缓存）+ 贴图台账（哪些图被反复用、哪些只用过一次），再可选联网拿微信侧 `material/get_materialcount` 的真实总数。贴图每张图都要占一格永久素材，是长期成本——推之前看 plan 里的 `quota`（台账下界，不联网），要准数就调它。本工具只读，不删任何东西：素材一旦进过草稿或已发布文章，删了会裂图，而插件看不见「线上文章在引用谁」，所以清理由人在公众平台后台看着做。',
     parameters: {
       account: { type: 'string', required: true, description: '查哪个号。' },
-      mediaId: { type: 'string', description: 'gzh_push_draft 返回的草稿 media_id。' },
+      live: { type: 'boolean', description: 'true = 顺便联网读微信的永久素材真实总数（要 appsecret）。默认 false = 只看本地台账，一次请求都不发。' },
+      warnAt: { type: 'number', description: '可选：素材数到这个线就在 alarm 里提示你复核贴图节奏。插件**不猜微信的名额**（官方没公开图片名额），所以不填就永远不会报「快满了」。' },
+    },
+    async execute(args) {
+      const account = resolveAccount(args.account, { needSecret: args.live === true })
+      const materials = store.readMaterials().filter(row => row.appid === account.appid)
+      const ledger = store.readLedger()
+      const stickerRows = ledger.filter(row => row.account === account.key && row.articleType === 'newspic')
+      const newsCoverRows = ledger.filter(row => row.account === account.key && row.articleType !== 'newspic')
+
+      // 复用率：同一张图（内容 sha）被几条贴图用过。复用是省名额的正解，
+      // 但只用过一次的散图才是让素材库长胖的东西——所以两边都要给出条数。
+      const usedBy = new Map()
+      for (const row of stickerRows) {
+        for (const sha of Array.isArray(row.imageShas) ? row.imageShas : []) {
+          usedBy.set(sha, (usedBy.get(sha) ?? 0) + 1)
+        }
+      }
+      const trackedShas = new Set(materials.map(row => row.sha.slice(0, 12)))
+      const seen = [...usedBy.entries()]
+      const reused = seen.filter(([sha, times]) => times > 1 && trackedShas.has(sha))
+      const orphans = [...trackedShas].filter(sha => !usedBy.has(sha))
+
+      let live = { checked: false, image: null, news: null, voice: null, video: null, error: '' }
+      if (args.live === true) {
+        try {
+          const client = createClient({
+            baseUrl: account.proxyUrl, token: account.proxyToken,
+            appid: account.appid, secret: account.appsecret, timeoutMs: cfg().timeoutMs,
+          })
+          const counts = await client.materialCount()
+          live = { checked: true, image: counts.image, news: counts.image_text, voice: counts.voice, video: counts.video, error: '' }
+        } catch (cause) {
+          live = { checked: false, image: null, news: null, voice: null, video: null, error: cause.message }
+        }
+      }
+
+      const counted = live.checked && live.image !== null ? live.image : materials.length
+      const basis = live.checked && live.image !== null ? '微信 material/get_materialcount（真数，含产线传的图）' : '本地台账（下界：产线脚本与后台手传的图不计入）'
+      const alarm = Number.isFinite(Number(args.warnAt)) && counted >= Number(args.warnAt)
+        ? `图片素材已 ${counted} 张，到了你设的 ${Math.round(Number(args.warnAt))} 的线：贴图前先 planOnly 看 quota，散图改成成套复用，别一格一张地长`
+        : null
+      return {
+        ok: true,
+        account: account.key,
+        appid: account.appid,
+        basis,
+        materials: {
+          tracked: materials.length,
+          wechatImage: live.image,
+          wechatError: live.error,
+          lastUploadedAt: materials[0]?.at ?? null,
+        },
+        stickerLedger: {
+          pushes: stickerRows.length,
+          imagesTotal: stickerRows.reduce((sum, row) => sum + Number(row.images ?? 0), 0),
+          distinctImages: usedBy.size,
+          reuseRate: usedBy.size === 0 ? null : Number((reused.length / usedBy.size).toFixed(2)),
+          // 只用过一次的图是最该收拾的：占一格永久素材，只在一条贴图里露过面。
+          singleUse: [...usedBy.values()].filter(times => times === 1).length,
+          topReused: seen.filter(([, times]) => times > 1).sort((a, b) => b[1] - a[1]).slice(0, 5)
+            .map(([sha, times]) => ({ sha, times, fileName: materials.find(row => row.sha.slice(0, 12) === sha)?.fileName ?? '' })),
+          // 台账里有但从没进过任何贴图：可能是失败那几次留下的，也可能是别条链路传的。
+          uploadedButNeverInSticker: orphans.length,
+        },
+        newsCoverLedger: { pushes: newsCoverRows.length, note: '图文封面走 uploadimg/临时素材的不占永久名额；只有显式登记的 thumb 才可能占' },
+        alarm,
+        next: live.checked
+          ? '清理请在公众平台素材库后台做（插件不删素材：进过草稿或已发布文章的图删掉就裂图，而插件看不见线上引用）'
+          : '要看微信侧真数，带 live=true（要 appsecret）',
+      }
+    },
+  })
+
+  register({
+    name: 'gzh_draft_verify',
+    description: '回读该号的草稿箱，验证刚推的草稿在不在、标题对不对（对齐产线 wechat_readback.py 的判据）。给了 mediaId 就精确找它，否则列最近 N 条给人对照。推的是贴图就带 articleType="newspic"：图文与贴图存在同一张草稿表里，回读时**只有 article_type 能区分**（贴图也会被微信回填 thumb_media_id，所以「有封面」绝不代表它是图文）。',
+    parameters: {
+      account: { type: 'string', required: true, description: '查哪个号。' },
+      mediaId: { type: 'string', description: 'gzh_push_draft / gzh_push_sticker 返回的草稿 media_id。' },
       title: { type: 'string', description: '期望标题；给了就逐条比对并报告是否命中。' },
+      articleType: { type: 'string', description: '期望类型：news（图文）或 newspic（贴图）。推贴图必须传 newspic——串了型在草稿列表里长得几乎一样，推到手机上才发现。' },
       count: { type: 'number', description: '回读条数，默认 10，最大 20。' },
     },
     async execute(args) {
@@ -1062,6 +1730,10 @@ export function registerTools(ctx, deps) {
         appid: account.appid, secret: account.appsecret, timeoutMs: cfg().timeoutMs,
       })
       const count = Math.round(numArg(args.count, 10, 1, 20))
+      const wantType = String(args.articleType ?? '').trim()
+      if (wantType !== '' && wantType !== 'news' && wantType !== 'newspic') {
+        throw fail(`articleType 只认 news 或 newspic，收到「${wantType}」`, '图文=news，贴图=newspic；不关心类型就不传这个参数')
+      }
       const drafts = await client.listDrafts(0, count)
       const mediaId = String(args.mediaId ?? '')
       const want = String(args.title ?? '').trim()
@@ -1069,12 +1741,17 @@ export function registerTools(ctx, deps) {
       const problems = []
       if (mediaId !== '' && found === null) problems.push(`草稿箱最近 ${count} 条里没有 ${mediaId}：可能超出回读范围，或推送其实没建成`)
       if (found !== null && want !== '' && found.title !== want) problems.push(`标题不一致：草稿里是「${found.title}」，期望「${want}」`)
+      // 串型检查：贴图与图文共用 draft/add，参数写错一个字段就可能推出另一种形态，
+      // 而它在草稿列表里几乎看不出差别（微信还会替贴图回填 thumb_media_id）。
+      if (found !== null && wantType !== '' && found.articleType !== wantType) {
+        problems.push(`类型不对：草稿里是「${found.articleType === 'newspic' ? '贴图 newspic' : '图文 news'}」，期望「${wantType === 'newspic' ? '贴图 newspic' : '图文 news'}」`)
+      }
       if (found !== null && found.articleCount > 1) problems.push(`草稿里有 ${found.articleCount} 篇（多图文），本插件只应该产出 1 篇`)
       return {
         ok: problems.length === 0,
         account: account.key,
         endpoint: client.endpoint,
-        checked: { mediaId: mediaId || null, title: want || null, count },
+        checked: { mediaId: mediaId || null, title: want || null, articleType: wantType || null, count },
         found,
         problems,
         drafts: drafts.slice(0, 10),
@@ -1085,7 +1762,7 @@ export function registerTools(ctx, deps) {
 
   /**
    * 给宿主：disposers 用来摘工具。
-   * 给面板路由：call() 只认这 8 个名字，参数与工具一致（同一份校验、同一份去重台账）。
+   * 给面板路由：call() 只认 handlers 里这几个名字，参数与工具一致（同一份校验、同一份去重台账）。
    */
   return {
     disposers,

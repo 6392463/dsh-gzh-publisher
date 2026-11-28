@@ -226,8 +226,12 @@ function inline(text, skin) {
 
 /** 微信正文里唯一稳的图片域名是自家的 mmbiz 图床。 */
 const MMBIZ_HOST = /(?:^|\/\/)(?:[\w-]+\.)*mmbiz\.qpic\.cn\//i
-/** 未认证订阅号正文里能点的只有微信自家域名的链接。 */
-const WECHAT_LINK = /^https?:\/\/(?:[\w-]+\.)*(?:weixin\.qq\.com|qq\.com)(?:[/?#]|$)/i
+/**
+ * 未认证订阅号正文里能点的只有微信自家域名的链接。
+ * 导出给贴图链路复用：图片消息的纯文本正文里裸写 http 链接一样被屏蔽，
+ * 两处各写一份迟早会漂移成「图文拦、贴图不拦」。
+ */
+export const WECHAT_LINK = /^https?:\/\/(?:[\w-]+\.)*(?:weixin\.qq\.com|qq\.com)(?:[/?#]|$)/i
 
 /**
  * 扫描成品 HTML，把推上去会被微信**静默处理**的东西挑出来：

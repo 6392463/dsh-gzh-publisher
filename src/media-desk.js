@@ -157,9 +157,12 @@ export function createMediaDesk(options = {}) {
   /**
    * 取一条产出的正文与素材清单（不做上传，只解析路径）。
    * @param {string} id item id（可只给前缀）。
+   * @param {{requireBody?: boolean}} [options] `requireBody=false` 放过「还没有可用正文」的条目。
+   *   贴图链路要的只是**配图**：一条图配几句话的贴图稿，production.article 可能就是空的，
+   *   按图文的标准拦下来就等于不让发贴图。图文那边继续要求正文（空正文推出去是篇白稿）。
    * @returns {{ id, title, markdown, cover, images, savedPath }}
    */
-  function read(id) {
+  function read(id, { requireBody = true } = {}) {
     const state = readState()
     if (state === null) throw new Error(`没找到自媒体工作台的数据（${stateFile}）`)
     const want = String(id ?? '').trim()
@@ -177,7 +180,7 @@ export function createMediaDesk(options = {}) {
     }
     const item = hits[0]
     const production = item.production ?? {}
-    if (!publishable(item)) throw new Error(`条目「${item.id}」还没有可用正文（production.article 为空），先在工作台生成/定稿`)
+    if (requireBody && !publishable(item)) throw new Error(`条目「${item.id}」还没有可用正文（production.article 为空），先在工作台生成/定稿`)
     const map = entry => {
       const asset = resolveAsset(entry?.src)
       const local = asset.localPath

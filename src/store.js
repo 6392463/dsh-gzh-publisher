@@ -19,6 +19,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { SKINS, normalizeSkinColors, migrateSkinKey, SKIN_KEY_PATTERN } from './layout.js'
+import { normalizeStickerRules } from './sticker.js'
 
 /** 需要掩码的字段。 */
 const SECRET_FIELDS = ['appsecret', 'proxyToken']
@@ -27,8 +28,15 @@ const SECRET_FIELDS = ['appsecret', 'proxyToken']
 export const ACCOUNT_FIELDS = [
   'name', 'alias', 'appid', 'appsecret', 'proxyUrl', 'proxyToken',
   'author', 'digest', 'thumbMediaId', 'contentSourceUrl',
-  'layout', 'skin', 'eyebrows', 'foot', 'tail', 'enabled', 'note', 'comment',
+  'layout', 'skin', 'eyebrows', 'foot', 'tail', 'enabled', 'note', 'comment', 'sticker',
 ]
+
+/**
+ * 账号里「块状、块内合并」的字段：整块传 null/'' 才清空，传部分字段只改那几项。
+ * 贴图规则必须走合并——它是闸门本身，模型只想放宽 minImages 却把 titleMax/textMax
+ * 顺手抹回默认值，等于悄悄改了另一道闸门。
+ */
+const MERGED_BLOCKS = { comment: normalizeComment, sticker: normalizeStickerRules }
 
 /**
  * 评论开关归一化：存成 `{ open?: boolean, fansOnly?: boolean }` 两个布尔。
@@ -69,12 +77,13 @@ function masked(value) {
 /**
  * @param {{ dir?: string }} [options]
  * @returns {{dir: string, accountsFile: string, skinsFile: string, rendersFile: string,
- *            ledgerFile: string, outDir: string,
+ *            ledgerFile: string, materialsFile: string, outDir: string,
  *            readAccounts: () => object, writeAccount: Function, deleteAccount: Function,
  *            publicAccount: Function, migrateAccounts: () => Array,
  *            readSkins: () => object, writeSkin: Function, deleteSkin: Function,
  *            readRenders: () => Array, appendRender: Function, findRender: Function,
  *            readLedger: () => Array, appendLedger: Function,
+ *            readMaterials: () => Array, findMaterial: Function, appendMaterial: Function,
  *            fingerprint: Function, atomicWrite: Function}}
  */
 export function createStore(options = {}) {
@@ -83,6 +92,7 @@ export function createStore(options = {}) {
   const skinsFile = join(dir, 'skins.json')
   const rendersFile = join(dir, 'renders.json')
   const ledgerFile = join(dir, 'ledger.json')
+  const materialsFile = join(dir, 'materials.json')
   const outDir = join(dir, 'out')
 
   /** 原子写：先写同目录 tmp 再 rename，避免半截文件。 */
@@ -145,11 +155,13 @@ export function createStore(options = {}) {
     const next = { ...current }
     for (const [field, value] of Object.entries(patch ?? {})) {
       if (value === null || value === '') delete next[field]
-      else if (field === 'comment') {
-        // 归一化后再存：面板传的是 checkbox（布尔），模型可能传 'false' 字符串。
-        const normalized = normalizeComment(value)
-        if (normalized === null) delete next.comment
-        else next.comment = normalized
+      else if (MERGED_BLOCKS[field] !== undefined) {
+        // 归一化后再存：面板传的是 checkbox（布尔），模型可能传 'false' 字符串或字符串数字。
+        // 块内合并——只改传进来的那几项（见 MERGED_BLOCKS 的注释）。
+        const normalized = MERGED_BLOCKS[field](value, { where: field })
+        const merged = { ...(current[field] ?? {}), ...(normalized ?? {}) }
+        if (Object.keys(merged).length === 0) delete next[field]
+        else next[field] = merged
       } else next[field] = value
     }
     for (const field of secrets) {
@@ -321,13 +333,54 @@ export function createStore(options = {}) {
     return createHash('sha256').update(`${account}\n${title}\n${content}`, 'utf8').digest('hex').slice(0, 16)
   }
 
+  /* ---------------------------- 永久素材缓存 ---------------------------- */
+
+  /**
+   * 贴图要的是**永久图片素材**的 media_id，一张就占一格永久素材库（上限 10 万，
+   * 但一张图重复上传十次就是十格，而且回看时根本分不清哪张是废的）。
+   * 所以按「哪个号 + 图片字节 sha256」记一次，同一张图在同一个号上只上传一次。
+   * key 里必须带 appid：media_id 是号内的 ID，A 号传的图在 B 号那儿不能用。
+   */
+  function readMaterials() {
+    if (!existsSync(materialsFile)) return []
+    try {
+      const data = JSON.parse(readFileSync(materialsFile, 'utf8'))
+      return Array.isArray(data?.materials) ? data.materials : []
+    } catch {
+      return []
+    }
+  }
+
+  /** @param {{appid: string, sha: string}} key 图片内容指纹。 */
+  function findMaterial(key) {
+    const wanted = `${String(key?.appid ?? '')}|${String(key?.sha ?? '')}`
+    if (String(key?.sha ?? '').trim() === '') return null
+    const hit = readMaterials().find(entry => `${entry?.appid ?? ''}|${entry?.sha ?? ''}` === wanted)
+    return hit === undefined ? null : hit
+  }
+
+  /** 记一次上传（同 key 覆盖，最新的排最前，只留最近 2000 条）。 */
+  function appendMaterial(entry) {
+    const saved = { ...entry, at: new Date().toISOString() }
+    const key = `${saved.appid ?? ''}|${saved.sha ?? ''}`
+    const materials = readMaterials().filter(row => `${row?.appid ?? ''}|${row?.sha ?? ''}` !== key)
+    materials.unshift(saved)
+    atomicWrite(materialsFile, `${JSON.stringify({ materials: materials.slice(0, 2000) }, null, 2)}\n`)
+    return saved
+  }
+
+  // 这里故意没有 removeMaterial：贴图素材是**永久**素材，只删本地缓存不删微信那边，
+  // 号里就多一张没人认领的图，缓存反而变成假的。清理只在公众平台素材库后台做，
+  // 插件这边由 gzh_material_audit 负责把「哪格是一次性浪费」报清楚。
+
   mkdirSync(outDir, { recursive: true })
 
   return {
-    dir, accountsFile, skinsFile, rendersFile, ledgerFile, outDir,
+    dir, accountsFile, skinsFile, rendersFile, ledgerFile, materialsFile, outDir,
     readAccounts, writeAccount, deleteAccount, publicAccount, migrateAccounts,
     readSkins, writeSkin, deleteSkin,
     readRenders, appendRender, findRender,
     readLedger, appendLedger, fingerprint, atomicWrite,
+    readMaterials, findMaterial, appendMaterial,
   }
 }

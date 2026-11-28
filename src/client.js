@@ -223,7 +223,7 @@ window.__ModuleLoader__.load({
       quoteBg: '引文底色', quoteText: '引文文字', heading: '标题色',
     }
 
-    function AccountForm({ account, skins, onSaved, onClose, onError, busy, setBusy }) {
+    function AccountForm({ account, skins, ruleFields, onSaved, onClose, onError, busy, setBusy }) {
       const blank = { key: '', name: '', alias: '', appid: '', proxyUrl: '', author: '', digest: '', thumbMediaId: '', contentSourceUrl: '', layout: '', note: '', enabled: true }
       const [draft, setDraft] = React.useState(() => {
         const base = { ...blank, ...(account ?? {}), appsecret: '', proxyToken: '' }
@@ -232,9 +232,14 @@ window.__ModuleLoader__.load({
         const comment = account?.comment ?? {}
         base.commentOpen = comment.open !== false
         base.commentFansOnly = comment.fansOnly === true
+        // 贴图规则只填「这个号自己配过的那几档」：留空 = 跟随全局。
+        // 绝不能拿生效值预填——那会把全局的数悄悄固化成账号级覆盖。
+        const sticker = account?.sticker?.configured ?? {}
+        for (const row of ruleFields ?? []) base[row.key] = String(sticker[row.key] ?? '')
         return base
       })
       const [clearSecret, setClearSecret] = React.useState(false)
+      const [resetSticker, setResetSticker] = React.useState(false)
       // account === null 表示「新建」，undefined 表示还没选（父层不渲染表单）
       const isNew = account === null
       const set = (field, value) => setDraft(current => ({ ...current, [field]: value }))
@@ -250,6 +255,15 @@ window.__ModuleLoader__.load({
             enabled: draft.enabled !== false,
             comment: { open: draft.commentOpen !== false, fansOnly: draft.commentFansOnly === true },
           }
+          // 贴图规则只发填了数的档：空 = 不改动（和密钥同一个道理）。
+          // 数值合法性不在这儿校——工具层 normalizeStickerRules 会按微信硬上限拒，错误直接冒到表单上方。
+          const sticker = {}
+          for (const row of ruleFields ?? []) {
+            const raw = String(draft[row.key] ?? '').trim()
+            if (raw !== '') sticker[row.key] = Number(raw)
+          }
+          if (Object.keys(sticker).length > 0) args.sticker = sticker
+          if (resetSticker === true) args.sticker = null
           // 没碰过的密钥字段干脆不传：传空串在工具层等于「删掉密钥」，
           // 只改个显示名却把密钥抹了，是最难查的一种翻车。
           if (draft.appsecret !== '') args.appsecret = draft.appsecret
@@ -309,6 +323,19 @@ window.__ModuleLoader__.load({
             h('input', { type: 'checkbox', checked: draft.commentOpen !== false, onChange: event => set('commentOpen', event.target.checked) }), '开放评论'),
           h('label', { className: 'gzh-bar', title: '不勾 = 谁都能评' },
             h('input', { type: 'checkbox', checked: draft.commentFansOnly === true, onChange: event => set('commentFansOnly', event.target.checked) }), '仅关注者可评论')),
+        // 贴图是「形式固定、只换内容」的那种日更，形式规范却常常是这个号自己的口径：
+        // 单图消息形式的号 6 张起步就是错的。所以这四档在这里改，不用去求 agent 写 JSON。
+        h('div', { className: 'gzh-field gzh-field--full', title: '留空 = 这一档跟随全局配置／内置默认。上限是微信的墙，填超了保存会被拒（错误会写在上面）' },
+          h('span', {}, '贴图规则（这个号自己的口径）'),
+          ...(ruleFields ?? []).map(row => h('label', { className: 'gzh-bar', key: row.key, title: row.hint },
+            h('span', {}, row.label),
+            h('input', {
+              className: 'gzh-input', style: { width: '84px' }, inputMode: 'numeric',
+              value: String(draft[row.key] ?? ''), placeholder: `全局 ${row.value ?? '—'}`,
+              onChange: event => set(row.key, event.target.value),
+            }))),
+          h('label', { className: 'gzh-bar', title: '勾上再保存：删掉这个号的全部贴图覆盖，四档都回到全局／内置默认' },
+            h('input', { type: 'checkbox', checked: resetSticker, onChange: event => setResetSticker(event.target.checked) }), '四档全部跟随全局')),
         field('备注', 'note'),
         h('label', { className: 'gzh-field' },
           h('span', {}, 'AppSecret（写一次，只回显尾 4 位）'),
@@ -476,6 +503,7 @@ window.__ModuleLoader__.load({
                 : h(AccountForm, {
                   key: editingAccount?.key ?? 'new',
                   account: editingAccount, skins: snapshot.skins,
+                  ruleFields: snapshot.stickerDefaults?.fields ?? [],
                   onSaved: saved, onClose: () => setEditingAccount(undefined),
                   onError, busy, setBusy,
                 }))),
@@ -515,6 +543,17 @@ window.__ModuleLoader__.load({
                 h('b', {}, '长边上限'), h('div', {}, `${snapshot.config.imageMaxEdge}px`),
                 h('b', {}, '超时'), h('div', {}, `${snapshot.config.timeoutMs}ms`),
                 h('b', {}, '压图引擎'), h('div', {}, snapshot.engine?.ready === true ? `就绪（Pillow ${snapshot.engine.version}）` : `不可用：${snapshot.engine?.error ?? '未探测'}`))),
+            // 贴图的形式规范：这四个数是「推送会被拦」的那四道闸，只读页必须看得见生效值与来源，
+            // 否则用户只能靠面板上那句提示去猜是哪一层配的。
+            h('div', { className: 'gzh-card' },
+              h('div', { className: 'gzh-cardhead' }, h('b', {}, '贴图形式规范（生效值）'),
+                h('span', { title: `微信硬上限：标题 ${snapshot.stickerDefaults?.hard?.title ?? '—'} 字／图 ${snapshot.stickerDefaults?.hard?.images ?? '—'} 张／摘要 ${snapshot.stickerDefaults?.hard?.digest ?? '—'} 字——这一档不在这里配，force 也绕不过` },
+                  snapshot.stickerDefaults?.summary ?? '')),
+              h('div', { className: 'gzh-kv' },
+                ...(snapshot.stickerDefaults?.fields ?? []).map(row => h('div', { key: row.key },
+                  h('b', { title: row.hint }, row.label),
+                  h('div', {}, `${row.value ?? '—'}（可填 ${row.min}~${row.max}｜来源 ${snapshot.stickerDefaults?.sources?.[row.key] ?? '内置默认'}`))),
+                h('b', {}, '怎么改'), h('div', {}, '全局档：DSH 设置 → 插件 → 公众号草稿推送 → 配置；单号档：左边「账号」里那四条。生效顺序：本次调用参数 > 账号 > 全局 > 内置默认。'))),
             h('div', { className: 'gzh-card' },
               h('div', { className: 'gzh-cardhead' }, h('b', {}, '文件位置')),
               h('div', { className: 'gzh-kv' },
@@ -544,6 +583,14 @@ window.__ModuleLoader__.load({
       const [alert, setAlert] = React.useState(null)
       const [rendered, setRendered] = React.useState(null)
       const [pushed, setPushed] = React.useState(null)
+      // 贴图（图片消息）是平行的一条链路：没有版式能预览，能核对的只有「选了哪几张图 + 那句说明」，
+      // 而图一旦推上去就占号上的永久素材名额，所以面板逼人先看一次 planOnly 的选图计划。
+      const [sticker, setSticker] = React.useState(null)
+      // 推之前还能改的东西（标题 / 说明 / 纯图 / 换封面 / 排掉某张）先攒在这里：
+      // 图相关的改动立刻 re-plan（还是不联网），文字类的改动跟着「推」那一下才发出去。
+      const [stickerEdit, setStickerEdit] = React.useState(null)
+      // 素材名额体检（gzh_material_audit）的结果：贴图每张图都占号上一格，推的人最该看见这个数。
+      const [audit, setAudit] = React.useState(null)
       const [preview, setPreview] = React.useState({ title: '', file: '', html: '' })
       const [settingsOpen, setSettingsOpen] = React.useState(props.openSettings === true)
       // 常驻提醒（停用 / 没账号）看完就能收掉；下一次状态变了它自然会再出现。
@@ -643,10 +690,30 @@ window.__ModuleLoader__.load({
           return `已进草稿箱 · 《${result.title ?? ''}》· media_id=${result.mediaId ?? ''}`
             + (bypassed > 0 ? ` · ⚠ 绕过 ${bypassed} 项（见推送台账）` : '')
         }
+        // 贴图没有「几节几段」可报：能报的就图数与说明字数，多出来的都留在右栏卡片里。
+        if (kind === '贴图选图' || kind === '推贴图') {
+          const plan = kind === '贴图选图' ? (result.plan ?? {}) : result
+          const imgs = plan.images ?? []
+          const warn = kind === '贴图选图' ? (plan.warnings ?? []).length : 0
+          return `${kind === '推贴图' ? '贴图已进草稿箱' : '贴图选图'} · 《${plan.title ?? ''}》· ${imgs.length} 图`
+            + (kind === '推贴图' ? `（新传 ${result.uploadedNow ?? 0}／复用 ${result.reused ?? 0}）· media_id=${result.mediaId ?? ''}`
+              : `（封面 ${imgs[0]?.fileName ?? '✗'}）· 说明 ${[...(plan.content ?? '')].length} 字`)
+            + ((plan.skipped ?? []).length > 0 ? ` · 跳过 ${plan.skipped.length} 张` : '')
+            + (warn > 0 ? ` · ⚠ ${warn} 条（见右栏）` : '')
+        }
         if (kind === '回读') {
           return result.ok === true
             ? `草稿箱已确认：${result.found?.title ?? result.checked?.mediaId ?? ''}`
             : `回读有问题：${(result.problems ?? []).join('；')}`
+        }
+        // 素材体检报的是「贴图占了几格永久素材」，不是这次推了什么；口径（下界还是真数）先说清。
+        if (kind === '素材体检') {
+          const m = result.materials ?? {}
+          const s = result.stickerLedger ?? {}
+          return `素材名额 · ${result.account ?? ''}：贴图用过 ${s.distinctImages ?? 0} 张不同图，台账记着 ${m.tracked ?? 0} 格`
+            + (typeof m.wechatImage === 'number' ? ` · 微信报 ${m.wechatImage} 张` : ' · 未联网（下界，要真数让 agent 跑 live）')
+            + ((s.singleUse ?? 0) > 0 ? ` · ${s.singleUse} 张只用过一次` : '')
+            + (typeof result.alarm === 'string' && result.alarm !== '' ? ' · ⚠ 到了你设的提醒线' : '')
         }
         return `已完成：${String(result.file ?? '') || (result.ok === true ? 'ok' : '')}`
       }
@@ -663,6 +730,10 @@ window.__ModuleLoader__.load({
       // 推送只在「这次会话里真的渲染成功」之后可用，推完立刻再锁上：
       // 宿主要求 renderId 对得上渲染台账，界面上就别给出绕过它的入口。
       const canPush = canWork && rendered !== null && pushed === null && (force !== true || reason.trim() !== '')
+      // 贴图只吃工作台条目里登记的配图（cover + images）。粘贴的 Markdown 里没有「哪张当封面」这件事，
+      // 所以粘贴正文时这两个按钮是灰的，而不是让用户选出一堆想不到的图。
+      const canSticker = canWork && itemId !== ''
+      const canStickerPush = canSticker && sticker !== null && pushed === null && String((sticker.plan ?? {}).itemId ?? '') === itemId && (force !== true || reason.trim() !== '')
       const accountLabel = activeAccount === null ? '（未选）' : `${activeAccount.name || activeAccount.key}｜${activeAccount.layoutLabel}`
       // 台账那两行现在要带封面与正文图数（老记录没这两个字段，就不显示，别编）。
       const renderMeta = entry => `${entry.layoutLabel ?? entry.layout} · ${fmtTime(entry.at)}`
@@ -671,6 +742,60 @@ window.__ModuleLoader__.load({
         ? `失败：${entry.error}`
         : `media_id=${entry.mediaId ?? ''}${entry.forced === true ? '（强制重推）' : ''} · ${fmtTime(entry.at)}`)
         + (entry.thumbMediaId === undefined ? '' : ` · 封面 ${(entry.thumbMediaId ?? '') !== '' ? '✓' : '✗（force 推的）'} · 正文 ${entry.bodyImages ?? 0} 图`)
+        + (entry.articleType === 'newspic' ? ` · 贴图 ${entry.images ?? 0} 图（封面 ${entry.coverImage ?? '?'}）` : '')
+
+      // 贴图卡片只有一份数据可看：planOnly 的选图计划（还没推），或刚推成的那条。
+      // 两者字段不一样长，这里归一成一份，卡片里就只管画。
+      const stickerView = (() => {
+        if (pushed !== null && pushed.articleType === 'newspic') {
+          return {
+            pushed: true, mediaId: String(pushed.mediaId ?? ''), title: pushed.title ?? '',
+            content: pushed.content ?? '', contentFrom: pushed.contentFrom ?? '', digest: pushed.digest ?? null,
+            digestFrom: pushed.digestFrom ?? '', skipped: [], warnings: pushed.warnings ?? [], stale: false,
+            quota: pushed.quota ?? null, repeat: pushed.repeatImages ?? [], rules: pushed.rules ?? null,
+            rows: (pushed.images ?? []).map((row, index) => `${index === 0 ? '封面 ' : ''}${row.fileName ?? ''} ${fmtBytes(row.bytes)}｜${row.uploaded === false ? `复用素材 ${row.mediaId}` : `已传成永久素材 ${row.mediaId ?? ''}`}`),
+          }
+        }
+        if (sticker === null) return null
+        const plan = sticker.plan ?? {}
+        return {
+          pushed: false, mediaId: '', title: plan.title ?? '', content: plan.content ?? '',
+          contentFrom: plan.contentFrom ?? '', digest: plan.digest ?? null, digestFrom: plan.digestFrom ?? '',
+          skipped: plan.skipped ?? [], warnings: plan.warnings ?? [],
+          stale: itemId !== '' && String(plan.itemId ?? '') !== itemId,
+          quota: plan.quota ?? null, repeat: plan.repeatImages ?? [], rules: plan.rules ?? null,
+          rows: (plan.images ?? []).map((row, index) => `${index === 0 ? '封面 ' : ''}${row.fileName ?? ''} ${fmtBytes(row.bytes)}｜${row.source ?? ''}`),
+        }
+      })()
+
+      // 贴图的形式规范：数字一律从后端要（plan.rules > 账号 sticker > 全局 stickerDefaults）。
+      // 面板里不出现 6/20/1000 这些字面量，否则改了配置页面还在说老规矩。
+      const sFallback = snapshot.stickerDefaults ?? {}
+      const sRuleSet = (stickerView === null ? null : stickerView.rules) ?? (activeAccount ?? {}).sticker ?? sFallback
+      const sVals = { ...(sFallback.values ?? {}), ...((sRuleSet ?? {}).values ?? {}) }
+      const sSum = String((sRuleSet ?? {}).summary ?? sFallback.summary ?? '')
+      const sHard = ((sRuleSet ?? {}).hard ?? sFallback.hard) ?? {}
+      const sWhere = key => String(((sRuleSet ?? {}).sources ?? {})[key] ?? (sFallback.sources ?? {})[key] ?? '内置默认')
+      // 本地改动优先显示：卡片上摊开的就是「按下推会发出去的那份」。
+      const sEdit = stickerEdit ?? {}
+      const sTitle = sEdit.title ?? String((stickerView ?? {}).title ?? '')
+      const sContent = sEdit.noText === true ? '' : (sEdit.content ?? String((stickerView ?? {}).content ?? ''))
+      const sDrops = Array.isArray(sEdit.dropImages) ? sEdit.dropImages : []
+      const sImages = ((sticker ?? {}).plan ?? {}).images ?? []
+      // 排到最后必须还剩图：把「还剩几张」摊在按钮的 disabled 上，别让人点了报错才知道。
+      const sLeft = sImages.filter(row => !sDrops.includes(row.fileName ?? '')).length
+      /** 组一份给 gzh_push_sticker 的参数（不含 planOnly）：攒着的改动全在里面。 */
+      const stickerBase = (next = {}) => {
+        const cover = Number.isInteger(next.coverIndex) ? next.coverIndex : (Number.isInteger(sEdit.coverIndex) ? sEdit.coverIndex : null)
+        const drops = Array.isArray(next.dropImages) ? next.dropImages : sDrops
+        return {
+          account, itemId,
+          ...only('title', sTitle),
+          ...(sEdit.noText === true ? { noText: true } : only('content', sContent)),
+          ...(cover === null ? {} : { coverIndex: cover }),
+          ...(drops.length > 0 ? { dropImages: drops } : {}),
+        }
+      }
 
       // 面板自己说「现在该点哪个」，那些「先…再…」的说明书就不用常驻在版面上。
       function nextStep() {
@@ -858,6 +983,28 @@ window.__ModuleLoader__.load({
                   ...(force === true ? { force: true } : {}),
                 }, result => setPushed(result)),
               }, busy === '推送草稿' ? '推送中…' : (pushed === null ? '推送到草稿箱' : '已推送（再推请重新渲染）')),
+              // 贴图走的是另一条链路：draft/add 里 article_type=newspic，不排版、不要作者。
+              // 形式规范是配置的（默认 6~20 图 / 标题 ≤20 字），微信硬上限才是死的：1~20 图 / 32 字。
+              h('div', { className: 'gzh-duo', style: { marginTop: '8px' } },
+                h('button', {
+                  className: 'gzh-btn', disabled: !canSticker,
+                  title: itemId === ''
+                    ? '贴图用的是工作台条目里登记的配图（封面 + 配图），先在左上选一篇文章'
+                    : `图片消息没有版式可排版：这一步只把「用哪几张图、第一张当封面、说明洗成什么样」列给你看，一行网络都不发（本号规范：${sSum}）`,
+                  onClick: () => run('贴图选图', 'gzh_push_sticker', { account, itemId, planOnly: true }, result => { setSticker(result); setStickerEdit(null); setPushed(null) }),
+                }, busy === '贴图选图' ? '核对中…' : '贴图：先看选图（不联网）'),
+                h('button', {
+                  className: 'gzh-btn', disabled: !canStickerPush,
+                  title: sticker === null
+                    ? '先看一次选图再推：每张图都会传成永久素材，占号上的素材名额，推前值得核对一眼'
+                    : `把 ${sLeft} 张图和一句说明推成贴图草稿（不套皮肤、不排版、不带作者）｜本号规范 ${sSum}`
+                      + (sLeft < Number(sVals.minImages ?? 0) ? `；图数不足 ${sVals.minImages} 张，会被闸门拦下——勾 force 写清原因才放行` : ''),
+                  onClick: () => run('推贴图', 'gzh_push_sticker', {
+                    ...stickerBase(),
+                    ...(force === true ? { force: true } : {}),
+                    ...only('reason', force === true ? reason : ''),
+                  }, result => { setPushed(result); setSticker(null); setStickerEdit(null) }),
+                }, busy === '推贴图' ? '上传中…' : '推贴图到草稿箱')),
               h('div', { className: 'gzh-bar', style: { marginTop: '8px' } },
                 h('button', {
                   className: `gzh-chip${autoPlace ? ' gzh-chip--on' : ''}`,
@@ -872,7 +1019,12 @@ window.__ModuleLoader__.load({
                   className: 'gzh-btn gzh-btn--mini',
                   disabled: busy !== '' || (pushed === null && rendered === null),
                   title: '确认刚推的草稿真的在草稿箱里、标题对得上',
-                  onClick: () => run('回读', 'gzh_draft_verify', { account, ...only('mediaId', pushed?.mediaId), ...only('title', rendered?.title) }),
+                  onClick: () => run('回读', 'gzh_draft_verify', {
+                    account,
+                    ...only('mediaId', pushed?.mediaId),
+                    ...only('title', pushed?.articleType === 'newspic' ? pushed.title : rendered?.title),
+                    ...only('articleType', pushed?.articleType),
+                  }),
                 }, busy === '回读' ? '回读中…' : '回读草稿箱')),
               h('div', { className: 'gzh-bar', style: { marginTop: '4px' } },
                 h('label', { title: '危险项：跳过重复推送与外链检查，必须写原因，台账留痕' },
@@ -915,6 +1067,95 @@ window.__ModuleLoader__.load({
                 ...rendered.images.map((row, index) => h('div', { key: index },
                   `${String(row.error ?? '') === '' ? '✓' : '✗'} ${shortPath(row.src ?? '')} ${fmtBytes(row.bytes)}${row.url ? `｜${shortPath(row.url)}` : ''}${row.note ? `｜${row.note}` : ''}${row.error ? `｜${row.error}` : ''}`)))),
 
+            // 贴图没有 iframe 可看：中间那块给它没用，就把「选了哪几张图 + 那句说明」摊在右边。
+            stickerView !== null && h('div', { className: 'gzh-card' },
+              h('div', { className: 'gzh-cardhead' }, h('b', {}, '贴图（图片消息）'),
+                stickerView.pushed === true
+                  ? h('span', { className: 'gzh-tag gzh-tag--ok' }, `已推 ${stickerView.mediaId}`)
+                  : h('span', { className: 'gzh-tag gzh-tag--warn' }, '未推送'),
+                h('div', { className: 'gzh-spacer' }),
+                h('span', { title: '贴图正文只支持纯文本，皮肤、小标签、落款都用不上' }, '不套皮肤'),
+                h('span', { title: `这条贴图生效的形式规范：${sSum}。数字来自哪一层看下面每行的「来自…」；微信硬上限 ${sHard.images ?? '—'} 图／标题 ${sHard.title ?? '—'} 字` }, `${stickerView.rows.length} 图／规范 ${sSum}`)),
+              stickerView.rows.length < Number(sVals.minImages ?? 0) && h('div', { className: 'gzh-alert gzh-alert--warn' },
+                `只有 ${stickerView.rows.length} 张图，不到「${sSum}」要求的 ${sVals.minImages} 张（这条规则来自${sWhere('minImages')}）：去工作台把配图补齐，或者这条改走图文；如果这个号的形式本来就不是 ${sVals.minImages} 张起步，那是设置→账号→贴图规则该改，不该天天勾 force。`),
+              stickerView.stale === true && h('div', { className: 'gzh-alert gzh-alert--warn' },
+                '这份选图计划不是当前这篇文章的：换了文章就重新点一次「先看选图」，推按钮已经锁住。'),
+              h('div', { className: 'gzh-kv' },
+                h('b', {}, '标题'), h('div', {}, `${sTitle}（${[...sTitle].length}/${sVals.titleMax ?? '—'} 字，规范来自${sWhere('titleMax')}；微信硬上限 ${sHard.title ?? '—'} 字）`),
+                h('b', {}, '说明'), h('div', {}, sContent === ''
+                  ? (Number(sVals.textMax ?? 0) === 0 ? `按「纯图不写说明」推（这条规则来自${sWhere('textMax')}）` : '✗ 没有说明文字：贴图可以只发图，但微信文档写 content 必填，真被拒了就补一句再推')
+                  : `${sContent}（${[...sContent].length}/${sVals.textMax ?? '—'} 字，规范来自${sWhere('textMax')}；纯文本原样送达）`),
+                h('b', {}, '说明来源'), h('div', {}, String(stickerView.contentFrom)),
+                h('b', {}, '摘要'), h('div', {}, stickerView.digest === null ? String(stickerView.digestFrom) : `${stickerView.digest}（${stickerView.digestFrom}）`)),
+              stickerView.rows.length > 0 && h('div', { className: 'gzh-imgs', style: { marginTop: '8px' } },
+                ...stickerView.rows.map((text, index) => h('div', { key: index }, text))),
+              (stickerView.skipped ?? []).length > 0 && h('div', { className: 'gzh-warn', style: { marginTop: '8px' } },
+                h('div', { className: 'gzh-cardhead' }, h('b', {}, `跳过了 ${stickerView.skipped.length} 张图`)),
+                ...stickerView.skipped.map((row, index) => h('div', { key: index, className: 'gzh-alert gzh-alert--warn' }, `${row.source ?? ''} ${row.src ?? ''}：${row.note ?? ''}`))),
+              stickerView.warnings.length > 0 && h('div', { className: 'gzh-warn', style: { marginTop: '8px' } },
+                h('div', { className: 'gzh-cardhead' }, h('b', {}, `要看 ${stickerView.warnings.length} 条`)),
+                ...stickerView.warnings.map((text, index) => h('div', { key: index, className: 'gzh-alert gzh-alert--warn' }, text)))),
+
+            // 选图之后、推之前：这是唯一还能反悔的窗口（一按「推」，每张图都要传成永久素材、占号上一格）。
+            // 换封面 / 排掉某张 = 立刻 re-plan（仍然不联网）；标题、说明、「纯图」开关攒着，跟「推」那一下一起发。
+            stickerView !== null && stickerView.pushed === false && stickerView.stale !== true && h('div', { className: 'gzh-card' },
+              h('div', { className: 'gzh-cardhead' }, h('b', {}, '推之前改一改'),
+                h('div', { className: 'gzh-spacer' }),
+                audit !== null && h('span', { title: String(audit.basis ?? '') }, `本号素材 ${audit?.materials?.tracked ?? '?'} 格`),
+                h('button', {
+                  className: 'gzh-btn gzh-btn--mini', disabled: busy !== '' || account === '',
+                  title: '按本地台账算（默认不联网）：这个号的永久素材被贴图占了多少格、多少是一次性浪费的。要微信那边的真数，让 agent 跑一次 live 体检',
+                  onClick: () => run('素材体检', 'gzh_material_audit', { account }, result => setAudit(result)),
+                }, busy === '素材体检' ? '体检中…' : '查素材名额')),
+              h('div', { className: 'gzh-kv' },
+                h('b', {}, '标题'), h('div', {},
+                  h('input', {
+                    className: 'gzh-input', value: sTitle, disabled: busy !== '',
+                    onChange: event => setStickerEdit({ ...sEdit, title: event.target.value }),
+                  }),
+                  h('span', { title: `规范 ${sVals.titleMax} 字（来自${sWhere('titleMax')}）；微信硬上限 ${sHard.title ?? '—'} 字，这一档 force 也绕不过` },
+                    `${[...sTitle].length}/${sVals.titleMax ?? '—'} 字${[...sTitle].length > Number(sVals.titleMax ?? 0) ? ' ← 超了，推会被拦' : ''}`)),
+                h('b', {}, '说明'), h('div', {},
+                  h('textarea', {
+                    className: 'gzh-textarea', style: { minHeight: '68px' }, value: sContent, disabled: busy !== '' || sEdit.noText === true,
+                    placeholder: '贴图说明只收纯文本：链接、图片写进来会被拦',
+                    onChange: event => setStickerEdit({ ...sEdit, content: event.target.value }),
+                  }),
+                  h('label', { title: 'noText：就是要一张说明都没有的纯图贴图（textMax=0 的号默认如此）；不勾又清空说明，插件会以为你要用账号默认口径' },
+                    h('input', {
+                      type: 'checkbox', checked: sEdit.noText === true, disabled: busy !== '',
+                      onChange: event => setStickerEdit({ ...sEdit, noText: event.target.checked }),
+                    }), ` 不要说明文字（当前 ${[...sContent].length}/${sVals.textMax ?? '—'} 字）`)),
+                h('b', {}, '配图'), h('div', {},
+                  ...sImages.map((row, index) => h('div', { key: row.fileName ?? index, className: 'gzh-bar' },
+                    h('span', { className: `gzh-chip${row.isCover === true ? ' gzh-chip--on' : ''}` }, `${row.position ?? index + 1} ${row.fileName ?? ''}`),
+                    h('button', {
+                      className: 'gzh-btn gzh-btn--mini', disabled: busy !== '' || row.isCover === true,
+                      title: '把这张挪到第一位当封面（贴图没有独立封面：第一张就是）。顺序变了，台账里算新的一条',
+                      onClick: () => run('贴图选图', 'gzh_push_sticker', { ...stickerBase({ coverIndex: row.position ?? index + 1 }), planOnly: true }, result => { setSticker(result); setStickerEdit(null) }),
+                    }, '设封面'),
+                    h('button', {
+                      className: 'gzh-btn gzh-btn--mini', disabled: busy !== '' || sLeft <= 1,
+                      title: sLeft - 1 < Number(sVals.minImages ?? 0) ? `排掉后只剩 ${sLeft - 1} 张，低于 ${sVals.minImages ?? '—'} 张的规范，真推得勾 force` : '这条不用这张图（重新算一次选图）',
+                      onClick: () => {
+                        const keep = [...sDrops, row.fileName ?? '']
+                        return run('贴图选图', 'gzh_push_sticker', { ...stickerBase({ dropImages: keep }), planOnly: true },
+                          result => { setSticker(result); setStickerEdit({ ...sEdit, dropImages: keep, coverIndex: null }) })
+                      },
+                    }, '不用这张'))),
+                  sDrops.length > 0 && h('div', {}, `已排掉 ${sDrops.length} 张：${sDrops.join('、')} `,
+                    h('button', {
+                      className: 'gzh-btn gzh-btn--mini', disabled: busy !== '', title: '把排掉的图全要回来',
+                      onClick: () => run('贴图选图', 'gzh_push_sticker', { ...stickerBase({ dropImages: [] }), planOnly: true },
+                        result => { setSticker(result); setStickerEdit({ ...sEdit, dropImages: [], coverIndex: null }) }),
+                    }, '全部恢复')))),
+              (stickerView.quota !== null || (stickerView.repeat ?? []).length > 0) && h('div', { className: 'gzh-kv', style: { marginTop: '6px' } },
+                h('b', {}, '素材名额'), h('div', {}, stickerView.quota === null ? '—'
+                  : `这批 ${stickerView.quota?.netNew ?? 0} 张要新传（${stickerView.quota?.alreadyUploaded ?? 0} 张这个号已经有了，直接复用）｜${stickerView.quota?.note ?? ''}`),
+                (stickerView.repeat ?? []).length > 0 && h('b', {}, '重复图'),
+                (stickerView.repeat ?? []).length > 0 && h('div', {},
+                  `${stickerView.repeat.length} 张以前发过（最多的一张用过 ${stickerView.repeat[0]?.times ?? 0} 次）：不影响推，只是老图还在占格；要清得去公众平台素材库后台，插件不碰删除`))),
+
             h('div', { className: 'gzh-card' },
               h('div', { className: 'gzh-cardhead' }, h('b', {}, '渲染记录'), '点一条在中间回看'),
               renders.length === 0
@@ -933,7 +1174,7 @@ window.__ModuleLoader__.load({
                 ? h('div', { className: 'gzh-empty' }, '还没有推送记录。')
                 : h('div', { className: 'gzh-list' },
                   ...pushes.slice(0, 12).map((entry, index) => h('div', { key: `${entry.at}-${index}`, className: 'gzh-row gzh-row--static' },
-                    h('div', { className: 'gzh-rowtitle' }, `${entry.account}｜${entry.title}`),
+                    h('div', { className: 'gzh-rowtitle' }, `${entry.account}｜${entry.title}${entry.articleType === 'newspic' ? '［贴图］' : ''}`),
                     h('div', { className: 'gzh-rowmeta' }, pushMeta(entry)))))),
           ),
         ),
